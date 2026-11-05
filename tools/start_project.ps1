@@ -3,8 +3,10 @@ param([switch]$CheckPythonOnly)
 
 $script:ProjectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $script:StartLog = $null
+$script:InstallLog = $null
 $script:Utf8 = New-Object System.Text.UTF8Encoding($false)
 $script:DependencyProbe = 'import mss,cv2,numpy,pathfinding,yaml,win32api,vgamepad,rapidocr,onnxruntime'
+$script:GpuProbe = 'import json,onnxruntime as ort; print(json.dumps(dict(providers=ort.get_available_providers()), ensure_ascii=False))'
 $script:StartupClock = $null
 $script:StartupTimeoutSeconds = 45.0
 
@@ -282,40 +284,300 @@ function Resolve-ProjectPython([switch]$CheckOnly) {
     return $selected
 }
 
-function Install-ProjectDependencies([string]$Python) {
-    $fingerprint = Get-DependencyFingerprint $Python
-    if (Test-DependencyCache $fingerprint) {
-        Write-StartupLog '依赖已验证且未变化，跳过耗时导入检查'
-        return
+function Get-InstallLogPath {
+    return Join-Path $script:ProjectRoot 'data\install.log'
+}
+
+function Initialize-InstallLog {
+    $path = Get-InstallLogPath
+    $script:InstallLog = $path
+    try {
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $path))
+        if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).Length -gt 2MB) {
+            Move-Item -LiteralPath $path -Destination ($path + '.1') -Force
+        }
+    } catch { }
+}
+
+function Write-InstallLog([string]$Message) {
+    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
+    Write-Host $line
+    if ($script:InstallLog) {
+        try {
+            [IO.File]::AppendAllText($script:InstallLog, "$line`r`n", $script:Utf8)
+        } catch { }
     }
-    Write-StartupLog '正在检查项目依赖'
-    $check = Invoke-PythonCommand $Python @('-I', '-c', $script:DependencyProbe) 60
-    if ($check.ExitCode -eq 0) {
-        Save-DependencyCache $fingerprint
-        Write-StartupLog '依赖检查完成'
-        return
+}
+
+function Write-StartupHeader {
+    $version = ''
+    try {
+        $version = (Get-Content -LiteralPath (Join-Path $script:ProjectRoot 'VERSION') -Raw -Encoding UTF8).Trim()
+    } catch { }
+    Write-StartupLog '----------------------------------------'
+    Write-StartupLog "启动会话：$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    if ($version) { Write-StartupLog "项目版本：$version" }
+    Write-StartupLog "系统：$([Environment]::OSVersion.VersionString)；64 位：$([Environment]::Is64BitOperatingSystem)；PowerShell：$($PSVersionTable.PSVersion)"
+    Write-StartupLog "项目目录：$script:ProjectRoot"
+    Write-StartupLog '----------------------------------------'
+}
+
+function Get-GpuRequirementsPath {
+    return Join-Path $script:ProjectRoot 'requirements-gpu.txt'
+}
+
+function Get-NvidiaGpuInfo {
+    # A working nvidia-smi is the strongest signal that CUDA can be used. WMI
+    # is only a fallback for machines where nvidia-smi is not on PATH.
+    $smi = Get-Command nvidia-smi -CommandType Application -All -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($smi) {
+        try {
+            $result = Invoke-PythonCommand $smi.Source @('--query-gpu=name,driver_version', '--format=csv,noheader') 10
+            if ($result.ExitCode -eq 0) {
+                $first = @($result.Output -split "`r?`n" | Where-Object { $_.Trim() })[0]
+                if ($first) {
+                    $fields = $first -split '\s*,\s*', 2
+                    return [pscustomobject]@{
+                        Name = $fields[0].Trim()
+                        Driver = if ($fields.Count -gt 1) { $fields[1].Trim() } else { '' }
+                        Source = 'nvidia-smi'
+                    }
+                }
+            }
+        } catch { }
     }
-    Write-StartupLog "依赖需要安装或修复：$($check.Error.Trim())"
-    $pip = Invoke-PythonCommand $Python @('-I', '-m', 'pip', '--version')
-    if ($pip.ExitCode -ne 0) {
-        $ensure = Invoke-PythonCommand $Python @('-I', '-m', 'ensurepip', '--upgrade') 120
-        if ($ensure.ExitCode -ne 0) { throw "pip 修复失败：$($ensure.Error.Trim())" }
+    try {
+        foreach ($adapter in @(Get-CimInstance Win32_VideoController -ErrorAction Stop)) {
+            if ($adapter.Name -match 'NVIDIA') {
+                return [pscustomobject]@{
+                    Name = [string]$adapter.Name
+                    Driver = [string]$adapter.DriverVersion
+                    Source = 'wmi'
+                }
+            }
+        }
+    } catch { }
+    return $null
+}
+
+function Test-CudaProvider([string]$Python) {
+    $result = Invoke-PythonCommand $Python @('-I', '-c', $script:GpuProbe) 60
+    if ($result.ExitCode -ne 0) {
+        return [pscustomobject]@{ Available = $false; Providers = ''; Detail = $result.Error.Trim() }
     }
-    Write-StartupLog '首次安装需要联网，下面会显示安装进度；失败后再次双击可继续。'
+    try {
+        $providers = @((ConvertFrom-Json $result.Output).providers)
+    } catch {
+        return [pscustomobject]@{ Available = $false; Providers = ''; Detail = '无法解析 onnxruntime 输出' }
+    }
+    return [pscustomobject]@{
+        Available = ($providers -contains 'CUDAExecutionProvider')
+        Providers = ($providers -join ', ')
+        Detail = ($providers -join ', ')
+    }
+}
+
+function Test-CudaInference([string]$Python) {
+    # Real inference is the only proof that the CUDA/cuDNN libraries load.
+    # The fixture is part of the release, so this also works after unzipping.
+    $fixture = Join-Path $script:ProjectRoot 'tests\fixtures\live_battle.png'
+    if (-not (Test-Path -LiteralPath $fixture)) { return $null }
+    $checkScript = Join-Path $script:ProjectRoot 'tools\check_ocr_acceleration.py'
+    if (-not (Test-Path -LiteralPath $checkScript)) { return $null }
+    $result = Invoke-PythonCommand $Python @($checkScript) 180
+    $detail = ($result.Output.Trim() + ' ' + $result.Error.Trim()).Trim()
+    if ($detail.Length -gt 400) { $detail = $detail.Substring(0, 400) }
+    return [pscustomobject]@{ Passed = ($result.ExitCode -eq 0); Detail = $detail }
+}
+
+function Get-GpuFingerprint([string]$Python, $Gpu) {
+    $interpreter = Get-Item -LiteralPath $Python -ErrorAction SilentlyContinue
+    $requirements = Get-Item -LiteralPath (Get-GpuRequirementsPath) -ErrorAction SilentlyContinue
+    $sitePackages = Join-Path (Split-Path -Parent (Split-Path -Parent $Python)) 'Lib\site-packages'
+    $site = Get-Item -LiteralPath $sitePackages -ErrorAction SilentlyContinue
+    $parts = @("probe=$script:GpuProbe")
+    $parts += "gpu=$($Gpu.Name)|$($Gpu.Driver)"
+    if ($interpreter) {
+        $parts += "python=$($interpreter.Length):$($interpreter.LastWriteTimeUtc.Ticks)"
+    } else {
+        $parts += 'python=missing'
+    }
+    if ($requirements) {
+        $parts += "requirements=$($requirements.Length):$($requirements.LastWriteTimeUtc.Ticks)"
+    } else {
+        $parts += 'requirements=missing'
+    }
+    if ($site) {
+        $parts += "site=$($site.LastWriteTimeUtc.Ticks)"
+    } else {
+        $parts += 'site=missing'
+    }
+    return ($parts -join '|')
+}
+
+function Get-GpuCachePath {
+    return Join-Path $script:ProjectRoot 'data\.gpu-deps.json'
+}
+
+function Read-GpuCache {
+    try {
+        return Get-Content -LiteralPath (Get-GpuCachePath) -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+}
+
+function Save-GpuCache([string]$Fingerprint, [string]$Status, [string]$Reason, [int]$RetryHours = 0) {
+    try {
+        [void][IO.Directory]::CreateDirectory((Join-Path $script:ProjectRoot 'data'))
+        $retryAt = 0
+        if ($RetryHours -gt 0) {
+            $retryAt = [DateTimeOffset]::UtcNow.AddHours($RetryHours).ToUnixTimeSeconds()
+        }
+        $payload = [ordered]@{
+            fingerprint = $Fingerprint
+            status = $Status
+            reason = $Reason
+            checked_at = (Get-Date).ToString('s')
+            retry_at = $retryAt
+        } | ConvertTo-Json
+        [IO.File]::WriteAllText((Get-GpuCachePath), $payload, $script:Utf8)
+    } catch {
+        Write-Verbose "CUDA 状态缓存写入失败：$($_.Exception.Message)"
+    }
+}
+
+function Invoke-PipInstall([string]$Python, [string[]]$Arguments) {
     $env:PYTHONIOENCODING = 'utf-8'
     $env:PYTHONUNBUFFERED = '1'
     $env:PIP_NO_INPUT = '1'
     $env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
     # Keep native stderr as log text in Windows PowerShell 5.1.
     $ErrorActionPreference = 'Continue'
-    & $Python -m pip install --disable-pip-version-check --prefer-binary --progress-bar off --timeout 30 --no-warn-script-location -r (Join-Path $script:ProjectRoot 'requirements.txt') 2>&1 | ForEach-Object {
-        Write-StartupLog $_.ToString()
+    $quoted = ($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
+    Write-InstallLog "pip install $quoted"
+    & $Python -m pip install --disable-pip-version-check --prefer-binary --progress-bar off --timeout 30 --retries 3 --no-warn-script-location @Arguments 2>&1 | ForEach-Object {
+        Write-InstallLog $_.ToString()
     }
-    $installExit = $LASTEXITCODE
-    if ($installExit -ne 0) { throw '依赖安装失败。请检查上方 pip 错误及网络连接后重试。' }
-    $check = Invoke-PythonCommand $Python @('-I', '-c', $script:DependencyProbe) 60
-    if ($check.ExitCode -ne 0) { throw "安装后依赖仍无法加载：$($check.Error.Trim())" }
-    # Installing packages updates site-packages, so refresh the fingerprint.
+    $exit = $LASTEXITCODE
+    if ($exit -eq 0) {
+        Write-InstallLog 'pip install 完成'
+    } else {
+        Write-InstallLog "pip install 失败（退出码 $exit）"
+    }
+    return ($exit -eq 0)
+}
+
+function Install-ProjectGpuDependencies([string]$Python) {
+    if ($env:WOWS_SKIP_GPU_INSTALL -eq '1') {
+        Write-StartupLog '已设置 WOWS_SKIP_GPU_INSTALL=1，跳过 CUDA 组件安装'
+        return
+    }
+    $gpu = Get-NvidiaGpuInfo
+    if (-not $gpu) {
+        Write-StartupLog '未检测到可用的 NVIDIA 显卡驱动，OCR 使用 CPU 运行时'
+        return
+    }
+    $driver = if ($gpu.Driver) { "，驱动 $($gpu.Driver)" } else { '' }
+    Write-StartupLog "检测到 NVIDIA 显卡：$($gpu.Name)$driver"
+    if ($gpu.Source -ne 'nvidia-smi' -and -not (Test-CudaProvider $Python).Available) {
+        # WMI only proves the hardware exists. Without a working driver the
+        # CUDA wheels cannot load, so do not download ~1 GB for nothing.
+        Write-StartupLog '未找到可用的 NVIDIA 驱动（nvidia-smi）；请安装/更新驱动后再启用 CUDA，本次 OCR 使用 CPU'
+        return
+    }
+    $fingerprint = Get-GpuFingerprint $Python $gpu
+    $cache = Read-GpuCache
+    $forced = ($env:WOWS_FORCE_GPU_INSTALL -eq '1')
+    if (-not $forced -and $cache -and [string]$cache.fingerprint -eq $fingerprint) {
+        if ($cache.status -in @('ready', 'ready_unverified')) {
+            $suffix = if ($cache.status -eq 'ready') { '已安装并验证' } else { '已安装，实机验证待任务启动时重试' }
+            Write-StartupLog "CUDA OCR 组件$suffix，跳过安装"
+            return
+        }
+        if ($cache.status -eq 'failed') {
+            $retryAt = 0.0
+            [void][double]::TryParse([string]$cache.retry_at, [ref]$retryAt)
+            $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            if ($retryAt -gt $now) {
+                $hours = [Math]::Ceiling(($retryAt - $now) / 3600)
+                Write-StartupLog "上次 CUDA 组件安装失败，约 $hours 小时后重试；本次使用 CPU（$($cache.reason)）"
+                return
+            }
+        }
+    }
+    $requirements = Get-GpuRequirementsPath
+    if (-not (Test-Path -LiteralPath $requirements)) {
+        Write-StartupLog "缺少 $requirements，跳过 CUDA 组件安装"
+        return
+    }
+    $provider = Test-CudaProvider $Python
+    if (-not $provider.Available) {
+        Write-StartupLog '正在安装 CUDA/cuDNN OCR 组件（首次可能需要数分钟，详细过程写入 data/install.log）'
+        if (-not (Invoke-PipInstall $Python @('-r', $requirements))) {
+            Save-GpuCache $fingerprint 'failed' 'pip install 失败' 6
+            Write-StartupLog 'CUDA 组件安装失败：OCR 将回退 CPU，6 小时后自动重试；可设置 WOWS_FORCE_GPU_INSTALL=1 立即重试'
+            return
+        }
+        $provider = Test-CudaProvider $Python
+    } else {
+        Write-StartupLog 'CUDA 运行组件已存在，跳过下载'
+    }
+    if (-not $provider.Available) {
+        Save-GpuCache $fingerprint 'failed' "onnxruntime 未提供 CUDAExecutionProvider（$($provider.Providers)）" 6
+        Write-StartupLog "CUDA 组件已安装，但运行时不支持 CUDA（$($provider.Providers)）；OCR 将回退 CPU"
+        return
+    }
+    $verified = Test-CudaInference $Python
+    if ($verified -and -not $verified.Passed) {
+        Save-GpuCache $fingerprint 'ready_unverified' "provider 可用，实机推理失败：$($verified.Detail)"
+        Write-StartupLog 'CUDA 组件已安装，但实机推理验证未通过；任务启动时会再次检查并自动回退 CPU'
+        return
+    }
+    if ($verified) {
+        Save-GpuCache $fingerprint 'ready' "provider 可用，实机推理通过（$($provider.Providers)）"
+        Write-StartupLog 'CUDA OCR 组件已安装并通过实机推理验证'
+    } else {
+        Save-GpuCache $fingerprint 'ready_unverified' "provider 可用，缺少验证截图"
+        Write-StartupLog "CUDA OCR 组件已安装（$($provider.Providers)）"
+    }
+}
+
+function Install-ProjectDependencies([string]$Python) {
+    $fingerprint = Get-DependencyFingerprint $Python
+    $verified = $false
+    if (Test-DependencyCache $fingerprint) {
+        Write-StartupLog '依赖已验证且未变化，跳过耗时导入检查'
+        $verified = $true
+    }
+    if (-not $verified) {
+        Write-StartupLog '正在检查项目依赖'
+        $check = Invoke-PythonCommand $Python @('-I', '-c', $script:DependencyProbe) 60
+        if ($check.ExitCode -eq 0) {
+            Save-DependencyCache $fingerprint
+            Write-StartupLog '依赖检查完成'
+            $verified = $true
+        }
+    }
+    if (-not $verified) {
+        Write-StartupLog "依赖需要安装或修复：$($check.Error.Trim())"
+        $pip = Invoke-PythonCommand $Python @('-I', '-m', 'pip', '--version')
+        if ($pip.ExitCode -ne 0) {
+            $ensure = Invoke-PythonCommand $Python @('-I', '-m', 'ensurepip', '--upgrade') 120
+            if ($ensure.ExitCode -ne 0) { throw "pip 修复失败：$($ensure.Error.Trim())" }
+        }
+        Write-StartupLog '首次安装需要联网，安装过程写入 data/install.log；失败后再次双击可继续。'
+        if (-not (Invoke-PipInstall $Python @('-r', (Join-Path $script:ProjectRoot 'requirements.txt')))) {
+            throw '依赖安装失败。请检查 data/install.log 中的 pip 错误及网络连接后重试。'
+        }
+        $check = Invoke-PythonCommand $Python @('-I', '-c', $script:DependencyProbe) 60
+        if ($check.ExitCode -ne 0) { throw "安装后依赖仍无法加载：$($check.Error.Trim())" }
+        # Installing packages updates site-packages, so refresh the fingerprint.
+        Save-DependencyCache (Get-DependencyFingerprint $Python)
+    }
+    Install-ProjectGpuDependencies $Python
+    # CUDA wheels also change site-packages; keep the next launch's cached
+    # base-dependency verification valid instead of re-running the full probe.
     Save-DependencyCache (Get-DependencyFingerprint $Python)
 }
 
@@ -343,6 +605,8 @@ function Start-Project {
             Move-Item -LiteralPath $script:StartLog -Destination ($script:StartLog + '.1') -Force
         }
     } catch { }
+    Initialize-InstallLog
+    Write-StartupHeader
     Write-StartupLog "启动入口：$script:ProjectRoot"
     $port = 8899
     if ($env:WOWS_PANEL_PORT -and (-not [int]::TryParse($env:WOWS_PANEL_PORT, [ref]$port) -or $port -lt 1 -or $port -gt 65535)) {

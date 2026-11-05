@@ -28,17 +28,18 @@
 
 ## 功能特性
 
-- **一键启动**：双击 `start_project.bat` 自动完成解释器检测、虚拟环境创建、依赖安装、控制台启动和浏览器打开，无需手敲 Python 命令。
+- **一键启动**：双击 `start_project.bat` 自动完成解释器检测、虚拟环境创建、基础依赖与 CUDA 组件安装、控制台启动和浏览器打开，无需手敲 Python 命令。
 - **两种客户端**：Steam 版与 WG Game Center 版（直接启动游戏本体），按区服版本自动选择可执行文件。
 - **两种模式**：联合作战、非对称作战。
 - **舰船支持**：波美拉尼亚、那不勒斯，以及按港口名称填写的自定义舰船。
 - **视觉闭环**：截图识别 → 决策 → 输入派发 → 小地图位移/画面反馈验证；证据不足时等待而不是盲操作。
+- **NVIDIA OCR 自动部署**：检测到 NVIDIA 显卡时自动安装 CUDA/cuDNN OCR 组件并做实机推理验证；无显卡或安装失败时自动回退 CPU。
 - **自动航行**：开局用 M 地图多帧投票锁定山体与占领点，之后由小地图持续更新自身位置、航向、敌舰与岛屿，自动选择航向、绕岛与进点。
 - **战斗控制**：主炮/副炮射击、R 损管、T/U/Y 消耗品、那不勒斯烟雾、近距离鱼雷自动瞄准与发射。
 - **结算与续局**：通过标题与资源列识别胜负和收益；能直接“继续战斗”时续局，不行则回港兜底。
 - **安全暂停**：切屏或键盘介入时冻结自动输入；暂停期间不抢焦点，恢复前重新识别当前画面。
 - **控制台**：八套主题、实时状态、本组累计、任务历史、实时日志、截图统计与清理、版本更新检查、中断任务接续。
-- **启动服务质量**：依赖检查缓存、控制台单实例、快速就绪探测、可调启动超时、日志自动滚动。
+- **启动服务质量**：依赖检查缓存、CUDA 安装结果缓存、控制台单实例、快速就绪探测、可调启动超时、日志自动滚动。
 
 ## 环境要求
 
@@ -53,7 +54,7 @@
 
 - 解压到普通磁盘目录（例如 `E:\wowws_bot\`），不要直接在压缩包内运行；
 - 避免桌面、OneDrive 同步目录或包含特殊符号的深层目录；
-- 显卡 OCR 为可选项（NVIDIA CUDA），缺失或失败时自动回退 CPU，不影响基本运行。
+- 显卡 OCR 为可选项（NVIDIA CUDA）：检测到 NVIDIA 显卡时首次启动会自动安装 CUDA/cuDNN 组件，缺失或安装失败时自动回退 CPU，不影响基本运行。
 
 ## 快速开始
 
@@ -85,10 +86,13 @@ git pull --ff-only
 1. 查找可用的 64 位 Python 3.11（`py`、PATH、注册表、常见安装目录）；
 2. 在项目内创建 `.venv` 并安装 `requirements.txt`；
 3. 检查依赖能否真实导入（失败会修复）；
-4. 启动本地控制台并等待接口就绪；
-5. 打开 <http://127.0.0.1:8899/>。
+4. 检测 NVIDIA 显卡：自动安装 CUDA/cuDNN OCR 组件并验证，无显卡或失败时回退 CPU；
+5. 启动本地控制台并等待接口就绪；
+6. 打开 <http://127.0.0.1:8899/>。
 
-以后启动会复用 `.venv` 和依赖检查缓存，通常几秒内完成；如果控制台已经在运行，脚本只打开网页，不会重复启动服务。
+检测到 NVIDIA 显卡时，首次启动还需要下载 CUDA/cuDNN 组件，可能多花几分钟。详细的 pip 与 CUDA 安装过程写入 `data/install.log`；CUDA 安装失败不会阻塞启动，OCR 会自动使用 CPU。
+
+以后启动会复用 `.venv`、基础依赖检查缓存和 CUDA 安装结果，通常几秒内完成；如果控制台已经在运行，脚本只打开网页，不会重复启动服务。
 
 失败时窗口会保留原因，详细日志在：
 
@@ -207,8 +211,16 @@ $env:WOWS_PYTHON = 'D:\Python311\python.exe'
 
 - **权限**：控制台默认以普通权限运行。只有检测到游戏确实以管理员权限运行、普通输入会被 Windows 拦截时，点击“开始自动战斗”才会弹出一次 UAC 确认并自动续接。
 
+- **CUDA 自动安装**：检测到 NVIDIA 显卡时，按 `requirements-gpu.txt` 自动安装 CUDA/cuDNN OCR 组件，并用真实推理验证；结果写入 `data/.gpu-deps.json` 缓存，失败约 6 小时后重试并回退 CPU。跳过或强制重装：
+
+  ```powershell
+  $env:WOWS_SKIP_GPU_INSTALL = '1'    # 跳过 CUDA 安装
+  $env:WOWS_FORCE_GPU_INSTALL = '1'   # 忽略缓存立即重装
+  ```
+
 - **日志**：
   - `data/startup.log`：启动脚本日志，超过 1 MB 滚动为 `startup.log.1`；
+  - `data/install.log`：pip 与 CUDA 组件安装明细，超过 2 MB 滚动为 `install.log.1`；
   - `data/control_server.stdout.log` / `data/control_server.stderr.log`：控制台进程输出（每次启动覆盖）；
   - `data/runtime.log`：当前任务的运行日志；
   - `wowws_bot.log`：运行器日志，5 MB × 3 自动滚动。
@@ -231,6 +243,8 @@ $env:WOWS_PYTHON = 'D:\Python311\python.exe'
 | `WOWS_PANEL_NO_BROWSER` | 空 | 设为 `1` 时不自动打开浏览器 |
 | `WOWS_STARTUP_TIMEOUT` | `45` | 等待控制台就绪的秒数（最小 5） |
 | `WOWS_FORCE_DEP_CHECK` | 空 | 设为 `1` 时忽略依赖检查缓存 |
+| `WOWS_SKIP_GPU_INSTALL` | 空 | 设为 `1` 时跳过 CUDA/cuDNN 组件安装 |
+| `WOWS_FORCE_GPU_INSTALL` | 空 | 设为 `1` 时忽略 CUDA 安装缓存，立即重新安装 |
 
 ### 任务参数（网页会自动设置）
 
@@ -358,11 +372,21 @@ reference/           历史参考数据
 
 ### 安装依赖失败
 
-检查网络后再次双击即可，已安装成功的内容会复用。NVIDIA OCR 组件安装或验证失败时会自动回退 CPU，不影响基本运行。
+检查网络后再次双击即可，已安装成功的内容会复用。NVIDIA OCR 组件安装或验证失败时会自动回退 CPU，不影响基本运行。详细安装过程见 `data/install.log`。
+
+### CUDA 组件安装失败或很慢
+
+首次启动检测到 NVIDIA 显卡时，会下载并安装 CUDA/cuDNN 组件，可能耗时数分钟，日志写入 `data/install.log`。
+
+- 安装失败不会阻塞启动，OCR 自动回退 CPU；
+- 约 6 小时后再次启动会自动重试；
+- 想立即重试：`$env:WOWS_FORCE_GPU_INSTALL = '1'`；
+- 只想用 CPU：`$env:WOWS_SKIP_GPU_INSTALL = '1'`；
+- 安装完成后可用 `tools/check_ocr_acceleration.py` 查看实际推理设备。
 
 ### 启动很慢或依赖检查反复进行
 
-第二次及以后启动会复用依赖检查缓存；只有解释器、`requirements.txt` 或已安装包变化时才重新验证。需要强制重查时设置 `WOWS_FORCE_DEP_CHECK=1`。首次解压或杀毒软件扫描期间可适当调大 `WOWS_STARTUP_TIMEOUT`。
+第二次及以后启动会复用依赖检查缓存；只有解释器、`requirements.txt` 或已安装包变化时才重新验证。CUDA 组件安装成功后也会走缓存，不再重复下载。需要强制重查时设置 `WOWS_FORCE_DEP_CHECK=1`。首次解压、杀毒软件扫描或首次安装 CUDA 期间可适当调大 `WOWS_STARTUP_TIMEOUT`。
 
 ### 端口被占用
 

@@ -178,3 +178,114 @@ def test_stale_instance_recorder_is_discarded(tmp_path):
         "{ throw 'stale recorder kept' }; 'stale_ok'"
     )
     assert output == "stale_ok"
+
+
+def gpu_project(tmp_path):
+    project = tmp_path / "project"
+    (project / "data").mkdir(parents=True)
+    (project / "requirements-gpu.txt").write_text(
+        "onnxruntime-gpu[cuda,cudnn]==1.29.0\n", encoding="utf-8"
+    )
+    python = project / ".venv" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"stub")
+    return project, python
+
+
+def test_gpu_install_is_skipped_without_nvidia_gpu(tmp_path):
+    project, python = gpu_project(tmp_path)
+    output = run_ps(
+        f"$script:ProjectRoot = {ps_literal(project)}; "
+        "$script:StartLog = $null; $script:InstallLog = $null; "
+        "function Get-NvidiaGpuInfo { return $null }; "
+        "function Invoke-PipInstall { throw 'pip must not run without an NVIDIA GPU' }; "
+        f"Install-ProjectGpuDependencies {ps_literal(python)}; 'gpu_skipped'"
+    )
+    assert output == "gpu_skipped"
+
+
+def test_gpu_install_failure_is_cached_and_force_retries(tmp_path):
+    project, python = gpu_project(tmp_path)
+    output = run_ps(
+        f"$script:ProjectRoot = {ps_literal(project)}; "
+        "$script:StartLog = $null; $script:InstallLog = $null; "
+        "function Get-NvidiaGpuInfo { [pscustomobject]@{ Name='RTX Test'; Driver='1.0'; Source='nvidia-smi' } }; "
+        "function Test-CudaProvider { [pscustomobject]@{ Available=$false; Providers=''; Detail='' } }; "
+        "function Test-CudaInference { return $null }; "
+        "$script:pipCalls = 0; "
+        "function Invoke-PipInstall { $script:pipCalls++; return $false }; "
+        f"Install-ProjectGpuDependencies {ps_literal(python)}; "
+        f"Install-ProjectGpuDependencies {ps_literal(python)}; "
+        "if ($script:pipCalls -ne 1) { throw 'cached failure was retried' }; "
+        "$env:WOWS_FORCE_GPU_INSTALL = '1'; "
+        f"Install-ProjectGpuDependencies {ps_literal(python)}; "
+        "if ($script:pipCalls -ne 2) { throw 'force retry ignored' }; "
+        f"$cache = Get-Content -LiteralPath {ps_literal(project / 'data' / '.gpu-deps.json')} -Encoding UTF8 -Raw | ConvertFrom-Json; "
+        "if ($cache.status -ne 'failed') { throw 'failure not cached' }; 'gpu_cache_ok'"
+    )
+    assert output == "gpu_cache_ok"
+
+
+def test_gpu_install_ready_state_skips_reinstall(tmp_path):
+    project, python = gpu_project(tmp_path)
+    output = run_ps(
+        f"$script:ProjectRoot = {ps_literal(project)}; "
+        "$script:StartLog = $null; $script:InstallLog = $null; "
+        "function Get-NvidiaGpuInfo { [pscustomobject]@{ Name='RTX Test'; Driver='1.0'; Source='nvidia-smi' } }; "
+        "$script:pipCalls = 0; $script:probeCalls = 0; "
+        "function Invoke-PipInstall { $script:pipCalls++; return $true }; "
+        "function Test-CudaProvider { $script:probeCalls++; "
+        "if ($script:probeCalls -le 1) { return [pscustomobject]@{ Available=$false; Providers=''; Detail='' } }; "
+        "[pscustomobject]@{ Available=$true; Providers='CUDAExecutionProvider'; Detail='' } }; "
+        "function Test-CudaInference { [pscustomobject]@{ Passed=$true; Detail='ok' } }; "
+        f"Install-ProjectGpuDependencies {ps_literal(python)}; "
+        f"$cache = Get-Content -LiteralPath {ps_literal(project / 'data' / '.gpu-deps.json')} -Encoding UTF8 -Raw | ConvertFrom-Json; "
+        "if ($cache.status -ne 'ready') { throw 'ready state not cached' }; "
+        f"Install-ProjectGpuDependencies {ps_literal(python)}; "
+        "if ($script:pipCalls -ne 1) { throw 'verified install reinstalled' }; 'gpu_ready_ok'"
+    )
+    assert output == "gpu_ready_ok"
+
+
+def test_gpu_install_requires_a_working_nvidia_driver(tmp_path):
+    project, python = gpu_project(tmp_path)
+    output = run_ps(
+        f"$script:ProjectRoot = {ps_literal(project)}; "
+        "$script:StartLog = $null; $script:InstallLog = $null; "
+        "function Get-NvidiaGpuInfo { [pscustomobject]@{ Name='NVIDIA GPU'; Driver='1.0'; Source='wmi' } }; "
+        "function Test-CudaProvider { [pscustomobject]@{ Available=$false; Providers='CPUExecutionProvider'; Detail='' } }; "
+        "function Invoke-PipInstall { throw 'pip must not run without a working driver' }; "
+        f"Install-ProjectGpuDependencies {ps_literal(python)}; 'driver_missing_ok'"
+    )
+    assert output == "driver_missing_ok"
+
+
+def test_gpu_install_skips_pip_when_cuda_already_available(tmp_path):
+    project, python = gpu_project(tmp_path)
+    output = run_ps(
+        f"$script:ProjectRoot = {ps_literal(project)}; "
+        "$script:StartLog = $null; $script:InstallLog = $null; "
+        "function Get-NvidiaGpuInfo { [pscustomobject]@{ Name='RTX Test'; Driver='1.0'; Source='nvidia-smi' } }; "
+        "function Invoke-PipInstall { throw 'pip must not run when CUDA is already available' }; "
+        "function Test-CudaProvider { [pscustomobject]@{ Available=$true; Providers='CUDAExecutionProvider'; Detail='' } }; "
+        "function Test-CudaInference { [pscustomobject]@{ Passed=$true; Detail='ok' } }; "
+        f"Install-ProjectGpuDependencies {ps_literal(python)}; "
+        f"$cache = Get-Content -LiteralPath {ps_literal(project / 'data' / '.gpu-deps.json')} -Encoding UTF8 -Raw | ConvertFrom-Json; "
+        "if ($cache.status -ne 'ready') { throw 'ready state not cached' }; 'gpu_present_ok'"
+    )
+    assert output == "gpu_present_ok"
+
+
+def test_install_log_captures_install_output(tmp_path):
+    project = tmp_path / "project"
+    (project / "data").mkdir(parents=True)
+    log = project / "data" / "install.log"
+    output = run_ps(
+        f"$script:ProjectRoot = {ps_literal(project)}; "
+        "$script:StartLog = $null; Initialize-InstallLog; "
+        "Write-InstallLog 'pip install sample'; "
+        f"if (-not (Test-Path -LiteralPath {ps_literal(log)})) {{ throw 'missing install log' }}; "
+        f"if (-not (Select-String -LiteralPath {ps_literal(log)} -Pattern 'pip install sample' -Quiet)) "
+        "{ throw 'missing install line' }; 'log_ok'"
+    )
+    assert output == "log_ok"
