@@ -29,7 +29,7 @@ def _payload(latest: str = "2026.11.01.1", **extra):
         "update_available": latest != "2026.11.01.1",
         "local_ahead": False,
         "source": "test",
-        "repo_url": "https://github.com/Fallme/wowws-bot",
+        "repo_url": "https://github.com/chongfenglaosiji/wowws-bot",
         "commit": {},
         "github": {},
         "stats": {},

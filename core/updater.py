@@ -24,7 +24,7 @@ VERSION_PATH = BASE_DIR / "VERSION"
 STATUS_PATH = DATA_DIR / "update_status.json"
 INSTALL_ID_PATH = DATA_DIR / "install_id"
 HEARTBEAT_STAMP_PATH = DATA_DIR / "heartbeat.json"
-DEFAULT_REPO = "Fallme/wowws-bot"
+DEFAULT_REPO = "chongfenglaosiji/wowws-bot"
 USER_AGENT = "wowws-bot-updater/1.0"
 
 _LOCK = threading.Lock()

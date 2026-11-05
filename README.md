@@ -2,8 +2,7 @@
 
 > 在 Windows 本地运行的《战舰世界》自动战斗控制台：在网页中选择舰船、战斗模式和停止条件后，程序自动完成启动游戏、港口检查、选择舰船、加入战斗、闭环驾驶、战斗控制、结算收益和下一局。
 
-- 本仓库：<https://github.com/chongfenglaosiji/wowws-bot>
-- 上游项目：<https://github.com/Fallme/wowws-bot>
+- 仓库：<https://github.com/chongfenglaosiji/wowws-bot>
 - 版本：见 [`VERSION`](VERSION)
 - 平台：Windows 10 / 11（64 位） · Python 3.11（64 位）
 
@@ -258,7 +257,7 @@ $env:WOWS_PYTHON = 'D:\Python311\python.exe'
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `WOWS_UPDATE_REPO` | `Fallme/wowws-bot` | 检查 `VERSION` 与 `main` 提交的仓库；用本仓库发布时可设为 `chongfenglaosiji/wowws-bot` |
+| `WOWS_UPDATE_REPO` | `chongfenglaosiji/wowws-bot` | 检查 `VERSION` 与 `main` 提交的仓库 |
 | `WOWS_UPDATE_CHECK_HOURS` | `6` | 正常检查缓存时长（每次进程启动仍会强制检查一次） |
 | `WOWS_UPDATE_RETRY_MINUTES` | `15` | 检查失败后的重试间隔 |
 | `WOWS_GITHUB_TOKEN` | 空 | 可选只读 token，用于显示 14 天克隆/访问量并提高 API 限额 |
