@@ -1,0 +1,203 @@
+# 战舰世界副炮流Bot - 船只配置
+# 启动时选择加载哪个船
+
+# === 波美拉尼亚 (Pommern) - 德系BB ===
+pommern:
+  name: "Pommern"
+  display_name: "波美拉尼亚"
+  type: "BB"
+  nation: "german"
+  has_torpedoes: true
+  has_smoke: false
+
+  main_gun:
+    reload: 26          # 主炮装填秒数
+    range: 24           # 主炮射程km
+    shell_speed: 800    # 炮弹速度m/s (用于提前量)
+
+  secondary:
+    range: 11.4         # 副炮射程km (满配)
+    reload: 3           # 副炮装填秒数
+
+  torpedo:
+    range: 6            # 鱼雷射程km
+    reload: 90          # 鱼雷装填秒数
+
+  navigation:
+    speed: 30           # 最高航速节
+
+  strategy:
+    # 航向与敌距由小地图白色舰首箭头、红点及 5km 网格计算。
+    preferred_side: 1                 # 1=right orbit, -1=left orbit
+    opening_seconds: 55
+    disengage_health: 0.28              # 兼容字段；站点逻辑不再因低血量主动掉头
+    brake_start_distance_km: 13.0
+    ideal_outer_distance_km: 11.2
+    ideal_inner_distance_km: 7.0
+    too_close_distance_km: 4.5
+    distance_ocr_min_confidence: 0.78
+    distance_stable_frames: 2
+    distance_maximum_spread_km: 0.45
+    distance_stale_seconds: 5.0
+    distance_ocr_interval_seconds: 0.18
+    # OCR 暂时不可用时按小地图每格 5 km 换算，不再使用经验比例猜距。
+    secondary_enter_distance: 0.18   # 兼容旧事件回放
+    ideal_outer_distance: 0.15       # 兼容旧事件回放
+    ideal_inner_distance: 0.10       # 兼容旧事件回放
+    too_close_distance: 0.07         # 兼容旧事件回放
+    island_warning_distance: 0.120   # 战列舰舵效慢，约提前 8km 建立绕岛转向
+    island_emergency_distance: 0.060 # 近岛立即硬舵，但仍保持向前脱离
+    island_turn_commit_seconds: 3.8  # 单次绕岛转向上限；新帧必须重新确认
+    rudder_minimum_hold_seconds: 4.0 # 普通航向修正避免左右指令反复抵消
+    pursue_enemies: true           # 避障后优先接敌，不再强制先占中央点
+    map_span_km: 50.0              # 未校准初值；按本局地图实际边长修改，不能假定每格5km
+    qe_speed_scale: 5.22           # 公开客户端换算推导的初值；优先采用新鲜实测位移速度
+    qe_turn_speed_retention: 0.76 # 波美拉尼亚实测约23.4/30.8；其他船仍为初值
+    qe_yaw_response_seconds: 4.0 # 回舵后残余转动的响应初值，尚未精确标定
+    autopilot_start_grace_seconds: 30.0 # 开局加速宽限
+    autopilot_confirmed_stall_seconds: 20.0 # 低速且新鲜位置连续不变才接管
+    autopilot_stall_takeover_seconds: 10.0 # 原生自动航行持续停顿后切换到闭环驾驶
+    battle_phase_unconfirmed_escape_seconds: 12.0 # 战斗HUD无法确认开战时凭角落Esc退回
+    qe_speed_knots: 30.0            # Q/E航迹预测使用的满速
+    qe_rudder_shift_seconds: 15.0   # 中舵到满舵约15秒
+    qe_turning_radius_km: 1.0       # 满舵稳态转弯半径
+    qe_prediction_horizon_seconds: 45.0 # 每帧预测45秒；避免长满舵圆圈误导局部规划
+    qe_safety_clearance_km: 0.45    # 舰体中心与岸线的最低预测净空
+    capture_throttle: 0.72           # 进入中央占领点后约 3/4 航速继续搜索
+    enemy_steering_weight: 0.84      # 前方红点优先，中央点仅作弱防漂移约束
+    center_steering_gain: 1.35       # 中央点航向控制增益
+    straight_opening_seconds: 4.0    # 先建立短航迹，随后立即转向中央点
+    stuck_seconds: 18.0              # 小地图位置完全不变时的兜底判定
+    stuck_low_speed_seconds: 8.0     # 已给前进指令但持续低速则判定触岸
+    stuck_low_speed_knots: 1.5       # 允许轻微漂移，避免0.4-0.6节永不触发
+    autopilot_stall_speed_knots: 1.5 # 绿色自动航行存在但低于此速度也视为卡住
+    stuck_reverse_seconds: 12.0     # 先倒船，再停车并按新船位重新规划
+    stuck_cooldown_seconds: 12.0     # 重规划后的加速宽限，避免立即重复脱困
+    opening_autopilot_minimum_seconds: 35.0 # 开局至少保留游戏自动航行，避免出生点红色误报取消
+    enable_minimap_torpedo_evasion: true   # 仅10km内确认驱逐/巡洋舰时允许覆盖
+    manual_intervention_pause_seconds: 5.0
+    manual_intervention_latch_seconds: 20.0
+    secondary_target_distance_km: 10.0
+    secondary_inner_distance_km: 7.0
+    capture_zone_match_ratio: 0.08
+    capture_arrival_distance_km: 4.5
+    course_minimum_travel_pixels: 5.0
+    post_battle_grace_seconds: 900
+    damage_control_retry_seconds: 3 # 仅表示按键尝试间隔，游戏自身判断实际冷却
+    damage_control_burst_threshold: 0.08 # 8秒内掉最大血量8%，下一次新鲜读数复核
+    damage_control_burst_window_seconds: 8
+    damage_control_sustained_threshold: 0.003 # 至少2秒、2次独立下降，累计掉最大血量0.3%
+    damage_control_sustained_window_seconds: 8
+    heal_threshold: 0.50            # 兼容旧配置
+    heal_loss_step: 0.20            # 兼容旧配置；当前受损后按30秒周期尝试其他消耗品
+    heal_cooldown_seconds: 30       # 兼容旧字段
+    other_consumable_cooldown_seconds: 30
+    other_consumable_health_threshold: 0.80 # 轻微掉血不使用；80%及以下每30秒尝试
+    heal_max_uses: 3                # 兼容旧配置
+    auto_torpedo: true              # 实际识别3号鱼雷图标后才会尝试
+    torpedo_close_distance_km: 6.0   # 6公里内（含边界）尝试；已知舰船还受鱼雷射程限制
+    torpedo_min_distance_km: 0.25    # 避免过近；可按本舰鱼雷引信距离调整
+    torpedo_retry_seconds: 8.0      # 不锁死整舰装填时间，复查当前发射器HUD
+    torpedo_alignment_timeout_seconds: 30.0 # 总尝试限时；每次输入仍须新截图，连续两帧对齐再射击
+    torpedo_input_max_frame_age_seconds: 4.0
+    torpedo_fire_distance: 6000      # 兼容旧字段；新流程使用上方近距离阈值
+    torpedo_avoid_distance: 3000     # 鱼雷规避距离 (米)
+    main_gun_shoot_threshold: 0.8    # 准心偏移容差
+
+# === 那不勒斯 (Napoli) - 意系巡洋 ===
+napoli:
+  name: "Napoli"
+  display_name: "那不勒斯"
+  type: "CA"
+  nation: "italian"
+  has_torpedoes: false
+  has_smoke: true
+
+  main_gun:
+    reload: 16          # 主炮装填秒数
+    range: 18           # 主炮射程km
+    shell_speed: 900    # 炮弹速度m/s
+
+  secondary:
+    range: 10.5         # 副炮射程km (满配)
+    reload: 2.5         # 副炮装填秒数
+
+  navigation:
+    speed: 36           # 最高航速节
+
+  strategy:
+    preferred_side: -1
+    opening_seconds: 48
+    disengage_health: 0.24              # 兼容字段；站点逻辑不再因低血量主动掉头
+    brake_start_distance_km: 13.5
+    ideal_outer_distance_km: 11.7
+    ideal_inner_distance_km: 7.5
+    too_close_distance_km: 4.8
+    distance_ocr_min_confidence: 0.78
+    distance_stable_frames: 2
+    distance_maximum_spread_km: 0.45
+    distance_stale_seconds: 5.0
+    distance_ocr_interval_seconds: 0.18
+    secondary_enter_distance: 0.18
+    ideal_outer_distance: 0.15
+    ideal_inner_distance: 0.10
+    too_close_distance: 0.07
+    island_warning_distance: 0.120
+    island_emergency_distance: 0.060
+    island_turn_commit_seconds: 3.8
+    rudder_minimum_hold_seconds: 4.0
+    pursue_enemies: true
+    map_span_km: 50.0              # 未校准初值；按本局地图实际边长修改
+    qe_speed_scale: 5.22
+    qe_turn_speed_retention: 0.80 # 波美拉尼亚实测约23.4/30.8；其他船仍为初值
+    qe_yaw_response_seconds: 4.0 # 回舵后残余转动的响应初值，尚未精确标定
+    autopilot_start_grace_seconds: 30.0 # 开局加速宽限
+    autopilot_confirmed_stall_seconds: 20.0 # 低速且新鲜位置连续不变才接管
+    autopilot_stall_takeover_seconds: 10.0 # 原生自动航行持续停顿后切换到闭环驾驶
+    battle_phase_unconfirmed_escape_seconds: 12.0 # 战斗HUD无法确认开战时凭角落Esc退回
+    qe_speed_knots: 36.0
+    qe_rudder_shift_seconds: 15.0
+    qe_turning_radius_km: 1.0
+    qe_prediction_horizon_seconds: 45.0
+    qe_safety_clearance_km: 0.45
+    capture_throttle: 0.72
+    enemy_steering_weight: 0.84
+    center_steering_gain: 1.35
+    straight_opening_seconds: 4.0
+    stuck_seconds: 16.0
+    stuck_low_speed_seconds: 7.0
+    stuck_low_speed_knots: 1.5
+    autopilot_stall_speed_knots: 1.5
+    stuck_reverse_seconds: 12.0
+    stuck_cooldown_seconds: 12.0
+    opening_autopilot_minimum_seconds: 35.0
+    enable_minimap_torpedo_evasion: true
+    manual_intervention_pause_seconds: 5.0
+    manual_intervention_latch_seconds: 20.0
+    secondary_target_distance_km: 10.0
+    secondary_inner_distance_km: 7.0
+    capture_zone_match_ratio: 0.08
+    capture_arrival_distance_km: 4.5
+    course_minimum_travel_pixels: 5.0
+    post_battle_grace_seconds: 900
+    damage_control_retry_seconds: 3
+    damage_control_burst_threshold: 0.08
+    damage_control_burst_window_seconds: 8
+    damage_control_sustained_threshold: 0.003
+    damage_control_sustained_window_seconds: 8
+    heal_threshold: 0.55            # 兼容旧配置
+    heal_loss_step: 0.20            # 兼容旧配置；当前受损后按30秒周期尝试其他消耗品
+    heal_cooldown_seconds: 30       # 兼容旧字段
+    other_consumable_cooldown_seconds: 30
+    other_consumable_health_threshold: 0.80 # 轻微掉血不使用；80%及以下每30秒尝试
+    heal_max_uses: 3                # 兼容旧配置
+    auto_smoke: true
+    auto_torpedo: true
+    torpedo_close_distance_km: 6.0
+    torpedo_min_distance_km: 0.25
+    torpedo_retry_seconds: 8.0
+    torpedo_alignment_timeout_seconds: 30.0
+    torpedo_input_max_frame_age_seconds: 4.0
+    main_gun_shoot_threshold: 0.8
+    torpedo_avoid_distance: 3000
+    smoke_threshold: 0.5    # 血量<50%放烟

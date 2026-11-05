@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" id="themeColorMeta" content="#f5f6f7" />
+    <meta name="description" content="战舰世界本地自动作战控制台" />
+    <title>战舰自动化控制台</title>
+    <link rel="stylesheet" href="/styles.css?v=20260927_2" />
+    <link rel="stylesheet" href="/custom_ship.css?v=20260927_2" />
+    <link rel="stylesheet" href="/themes/base.css?v=20261101_1" />
+    <script>
+      (function () {
+        var themes = [
+          "classic", "light-gold", "mid-grey", "mono",
+          "navy", "amber", "teal", "violet"
+        ];
+        var aliases = { endfield: "light-gold", arknights: "mid-grey" };
+        var colors = {
+          classic: "#0c171c",
+          "light-gold": "#f5f6f7",
+          "mid-grey": "#6d7276",
+          mono: "#ffffff",
+          navy: "#0e1622",
+          amber: "#1c1511",
+          teal: "#e7efee",
+          violet: "#efedf4"
+        };
+        var theme = "light-gold";
+        try {
+          var query = new URLSearchParams(location.search).get("theme") || "";
+          var saved = localStorage.getItem("wowsConsoleTheme") || "";
+          query = aliases[query] || query;
+          saved = aliases[saved] || saved;
+          if (themes.indexOf(query) >= 0) theme = query;
+          else if (themes.indexOf(saved) >= 0) theme = saved;
+        } catch (error) {}
+        document.documentElement.dataset.theme = theme;
+        document.write(
+          '<link id="themeStylesheet" rel="stylesheet" href="/themes/' +
+            theme + '.css?v=20261029_2">'
+        );
+        var meta = document.getElementById("themeColorMeta");
+        if (meta) meta.setAttribute("content", colors[theme]);
+      })();
+    </script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="masthead">
+        <div class="brand-lockup">
+          <span class="brand-monogram">W</span>
+          <div><p>LOCAL BATTLE AUTOMATION</p><h1>战舰自动化控制台</h1></div>
+        </div>
+        <div class="header-tools">
+          <div class="update-panel" id="updatePanel">
+            <button type="button" class="update-chip" id="updateChip" aria-haspopup="dialog" aria-expanded="false" title="检查更新">
+              <span class="update-dot" id="updateDot"></span><span id="updateVersion">更新</span>
+            </button>
+            <div class="update-popover" id="updatePopover" role="dialog" aria-label="版本更新" hidden>
+              <div class="update-head"><strong>版本更新</strong><button type="button" class="update-close" id="updateClose" aria-label="关闭">×</button></div>
+              <dl class="update-rows">
+                <div><dt>当前版本</dt><dd id="updateCurrent">—</dd></div>
+                <div><dt>最新版本</dt><dd id="updateLatest">—</dd></div>
+                <div><dt>最近提交</dt><dd id="updateCommit">—</dd></div>
+                <div><dt>活跃用户</dt><dd id="updateActive">—</dd></div>
+              </dl>
+              <p class="update-note" id="updateNote">正在读取更新信息…</p>
+              <div class="update-actions">
+                <button type="button" class="update-check" id="updateCheck">重新检查</button>
+                <a class="update-link" id="updateLink" href="https://github.com/Fallme/wowws-bot" target="_blank" rel="noopener">打开仓库</a>
+              </div>
+            </div>
+          </div>
+          <div class="theme-picker" id="themePicker">
+            <button type="button" class="theme-trigger" id="themeTrigger" aria-haspopup="listbox" aria-expanded="false" title="切换界面主题">
+              <i class="swatch"></i><span id="themeCurrentLabel">浅金</span><b class="caret">▾</b>
+            </button>
+            <div class="theme-menu" id="themeMenu" role="listbox" aria-label="界面主题" hidden>
+              <button type="button" class="theme-option" role="option" data-theme-option="classic" aria-selected="false"><i class="swatch"></i><span>黑金</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="light-gold" aria-selected="true"><i class="swatch"></i><span>浅金</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="mid-grey" aria-selected="false"><i class="swatch"></i><span>中灰</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="mono" aria-selected="false"><i class="swatch"></i><span>灰白</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="navy" aria-selected="false"><i class="swatch"></i><span>深蓝</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="amber" aria-selected="false"><i class="swatch"></i><span>暖褐</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="teal" aria-selected="false"><i class="swatch"></i><span>青灰</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="violet" aria-selected="false"><i class="swatch"></i><span>紫灰</span><b class="check">✓</b></button>
+            </div>
+          </div>
+          <div class="system-chip" id="systemChip">
+            <span class="pulse"></span>
+            <div><small>系统状态</small><strong id="systemStatus">待机</strong></div>
+            <time id="clock">--:--:--</time>
+          </div>
+        </div>
+      </header>
+
+      <section class="command-grid">
+        <article class="deck-card preset-card">
+          <div class="section-title"><span>01</span><div><small>MISSION PRESET</small><h2>预设设置</h2></div></div>
+          <div class="control-group launcher-control">
+            <div class="label-row"><label>游戏客户端</label><span>自动检索安装路径</span></div>
+            <div class="choice-grid" id="launcherGrid"></div>
+          </div>
+          <div class="control-group"><label>战斗模式</label><div class="choice-grid" id="modeGrid"></div></div>
+          <div class="control-group">
+            <div class="label-row"><label>选择舰船</label><span id="shipCount">0 艘</span></div>
+            <div class="ship-selector-tabs" role="tablist" aria-label="舰船选择方式">
+              <button class="ship-selector-tab active" id="presetShipTab" data-ship-tab="presets" role="tab" aria-controls="shipPresetPanel" aria-selected="true">预设舰船</button>
+              <button class="ship-selector-tab" id="customShipTab" data-ship-tab="custom" role="tab" aria-controls="customShipFields" aria-selected="false">自定义舰船</button>
+            </div>
+            <div class="ship-tab-panel" id="shipPresetPanel" role="tabpanel" aria-labelledby="presetShipTab">
+              <div class="ship-list ship-preset-scroll" id="shipList" tabindex="0" role="region" aria-label="舰船列表，可上下滚动"></div>
+            </div>
+            <div class="custom-ship-fields ship-tab-panel" id="customShipFields" role="tabpanel" aria-labelledby="customShipTab" hidden>
+              <label for="customShipName">完整舰船名称</label>
+              <input id="customShipName" type="text" maxlength="64" autocomplete="off" placeholder="例如：大选帝侯" />
+              <label for="customSecondaryRange">副炮射程</label>
+              <div class="range-input"><input id="customSecondaryRange" type="number" min="1" max="30" step="0.1" value="10.0" /><span>km</span></div>
+              <button class="save-preset-button" id="saveCustomPresetBtn" type="button">保存到预设</button>
+              <p>名称须与港口显示完全一致；保存后可在“预设舰船”中直接选择。</p>
+            </div>
+          </div>
+          <div class="control-group stop-plan">
+            <label>自动停止</label>
+            <div class="tab-switch" role="group" aria-label="自动停止条件">
+              <button class="limit-tab active" data-limit="rounds">完整对局</button>
+              <button class="limit-tab" data-limit="duration">运行时长</button>
+              <button class="limit-tab" data-limit="continuous">不限</button>
+            </div>
+            <div class="number-control" id="numberControl">
+              <button id="minusBtn" aria-label="减少">−</button>
+              <input id="limitValue" type="number" min="1" max="100" value="5" />
+              <span id="limitUnit">局</span>
+              <button id="plusBtn" aria-label="增加">+</button>
+            </div>
+            <p id="limitHint">完整结束 5 局后返回港口并停止</p>
+          </div>
+          <label class="quick-battle-toggle"><input id="quickBattle" type="checkbox" /><span><b>快速战斗</b><small>单局最多 5 分钟；计入计划局数，不统计收益或胜负</small></span></label>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <label class="quick-battle-toggle"><input id="closeGameWhenDone" type="checkbox" /><span><b>完成后关闭游戏</b></span></label>
+          <label class="quick-battle-toggle"><input id="shutdownWhenDone" type="checkbox" /><span><b>运行完关机</b></span></label>
+          </div>
+          <div class="readiness" id="calibrationCard"><span></span><div><strong id="calibrationTitle">启动时自动检查</strong><small id="calibrationMessage">画面、港口和输入均由系统确认</small></div></div>
+          <div class="action-row"><button class="start-button" id="startBtn"><span>开始自动战斗</span><b>→</b></button><button class="stop-button" id="stopBtn" disabled>终止任务</button></div>
+          <p class="microcopy">开始后自动启动游戏、校验港口、选择舰船并循环完整对局。</p>
+        </article>
+
+        <article class="deck-card live-card">
+          <div class="section-title live-section-title"><span>02</span><div><small>LIVE OPERATION</small><h2>当前状态</h2></div>
+          <div class="ocr-toolbar" title="切换在下次任务生效；显卡组件自动安装，失败回退 CPU">
+            <span class="ocr-toolbar-label" id="ocrRuntimeStatus" role="status">OCR 待机</span>
+            <input type="hidden" id="ocrDevice" value="nvidia" />
+            <div class="ocr-device-switch" role="group" aria-label="OCR 识别设备，下次任务生效">
+              <button type="button" data-ocr-device="cpu" aria-pressed="false">CPU</button>
+              <button type="button" data-ocr-device="nvidia" aria-pressed="true">NVIDIA</button>
+            </div>
+          </div>
+          <em id="liveBadge">OFFLINE</em></div>
+          <div class="operation-copy operation-banner"><small>当前阶段</small><strong id="movementMode">等待任务</strong><p id="movementReason">配置预设后即可开始</p></div>
+          <div class="live-workspace">
+            <div class="map-column">
+              <div class="route-visual" id="routeVisual">
+                <div class="route-ring ring-one"></div><div class="route-ring ring-two"></div>
+                <div class="radar-island-layer" id="mapIslands"></div>
+                <div class="radar-zone-layer" id="mapZones"></div>
+                <div class="radar-contact-layer" id="mapContacts"></div>
+                <div class="map-track" id="routeLine"></div>
+                <span class="map-center-marker">＋</span>
+                <span class="capture-zone-marker" id="mapObjective"><b id="mapObjectiveLabel">点</b></span>
+                <span class="enemy-marker" id="mapEnemy">◆</span>
+                <span class="ship-marker" id="mapPlayer" aria-label="舰船位置"></span>
+                <span class="route-node goal" id="mapGoal">目标</span>
+              </div>
+              <div class="progress-panel">
+                <div class="progress-head"><div><small>计划进度</small><strong id="roundDisplay">0 / 5 局</strong></div><div><small>运行时间</small><strong id="elapsedTime">00:00:00</strong></div></div>
+                <div class="progress-track"><span id="progressBar"></span></div><p><span id="progressMessage">等待任务启动</span><b id="progressPercent">0%</b></p>
+              </div>
+            </div>
+            <div class="telemetry-panel">
+              <div class="telemetry-grid">
+                <div><small>航线阶段</small><strong id="routePhase">未规划</strong></div><div><small>航线进度</small><strong id="routeProgress">0%</strong></div>
+                <div><small>距点位</small><strong id="captureDistance">—</strong></div><div><small>前方接敌目标</small><strong id="targetDistance">—</strong></div>
+                <div><small>舰船 / 模式</small><strong id="activeSetup">—</strong></div><div><small>视觉 / 计算</small><strong id="visionStatus">—</strong></div>
+                <div><small>位移反馈</small><strong id="feedbackStatus">—</strong></div><div><small>本轮状态</small><strong id="roundState">未开始</strong></div>
+                <div><small>自动航行</small><strong id="autopilotStatus">未开启</strong></div><div><small>当前舵位</small><strong id="rudderStatus">中舵</strong></div>
+                <div><small>小地图态势</small><strong id="mapSituation">等待识别</strong></div><div><small>导航依据</small><strong id="navigationStatus">—</strong></div>
+                <div><small>舰体状态</small><strong id="shipStatus">生命 —</strong></div><div><small>实时航速</small><strong id="speedStatus">—</strong></div>
+                <div><small>小地图航向</small><strong id="headingStatus">—</strong></div><div><small>消耗品状态</small><strong id="consumableStatus">等待识别</strong></div>
+              </div>
+            </div>
+          </div>
+          <div class="log-pane" aria-label="实时日志"><div class="log-pane-heading"><span>实时日志</span><div><small id="screenshotUsage">截图统计中</small><button id="clearScreenshotsBtn" type="button">清理截图</button></div></div><pre id="logOutput">[SYSTEM] 控制台已就绪</pre></div>
+          <div class="run-id-line">运行编号 <span id="runId">—</span></div>
+        </article>
+
+        <article class="deck-card totals-card">
+          <div class="section-title"><span>03</span><div><small>TASK TOTAL</small><h2>本组累计</h2></div><em class="task-badge" id="taskBadge">暂无任务</em></div>
+          <p class="task-note" id="taskNote">开始任务后从零累计，完成后保留；下一次开始时自动重置。</p>
+          <div class="task-reward-grid">
+            <div class="reward-total credits"><small>银币</small><strong id="creditsTotal">0</strong><span>本组累计</span></div>
+            <div class="reward-total ship-xp"><small>经验</small><strong id="shipXpTotal">0</strong><span>本组累计</span></div>
+            <div class="reward-total free-xp"><small>全局经验</small><strong id="freeXpTotal">0</strong><span>本组累计</span></div>
+            <div class="reward-total task-time"><small>累计用时</small><strong id="taskDuration">00:00:00</strong><span>本组实际运行时间</span></div>
+          </div>
+          <div class="task-history-heading"><strong>自动作战历史</strong><span id="historySummary">暂无历史任务</span></div>
+          <div class="task-history" id="taskHistory"><p class="history-empty">完成过的自动作战任务会显示在这里。</p></div>
+        </article>
+      </section>
+    </main>
+    <div class="toast" id="toast" role="status"></div><script src="/update-panel.js?v=20261101_1" defer></script><script src="/theme-switcher.js?v=20261029_2" defer></script><script src="/app.js?v=20260927_2" defer></script>
+  </body>
+</html>

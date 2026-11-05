@@ -1,0 +1,566 @@
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+try:
+    import cv2
+    import numpy as np
+except ImportError:  # The production environment installs requirements.txt.
+    cv2 = np = None
+
+
+@unittest.skipUnless(cv2 is not None, "OpenCV runtime is not installed")
+class PortSelectionTests(unittest.TestCase):
+    FIXTURE_ROOT = Path("tests") / "fixtures"
+    @classmethod
+    def setUpClass(cls):
+        # Keep the pure screenshot tests independent of Windows capture drivers.
+        sys.modules.setdefault("mss", types.SimpleNamespace(MSS=object))
+        sys.modules.setdefault(
+            "core.window",
+            types.SimpleNamespace(
+                activate_window=lambda _hwnd: True,
+                ensure_game_window_foreground=lambda _hwnd: True,
+                get_client_rect=lambda _hwnd: {
+                    "left": 0,
+                    "top": 0,
+                    "width": 2560,
+                    "height": 1440,
+                },
+                get_window_rect=lambda _hwnd: {
+                    "left": 0,
+                    "top": 0,
+                    "width": 2560,
+                    "height": 1440,
+                },
+                physical_click=lambda _x, _y, **_kwargs: True,
+                physical_scroll=lambda _x, _y, _delta, **_kwargs: True,
+                window_message_click=lambda _hwnd, _x, _y: True,
+            ),
+        )
+        from core.ocr import OcrToken
+        from port_navigator import (
+            _find_mode_card_from_ocr,
+            battle_survey_dismiss_point,
+            ShipSelectionError,
+            detect_selected_ship,
+            detect_port_mode,
+            ensure_requested_mode,
+            find_custom_ship_card,
+            find_builtin_ship_card,
+            find_ship_card,
+            is_custom_ship_selected,
+            is_requested_ship_selected,
+            in_battle_type_selector,
+            is_battle_survey_page,
+            is_port_exit_confirmation_page,
+            port_exit_confirmation_no_action_point,
+            select_requested_ship,
+            selected_ship_scores,
+            _verify_builtin_ship_after_click,
+        )
+
+        cls.OcrToken = OcrToken
+        cls.find_mode_card_from_ocr = staticmethod(_find_mode_card_from_ocr)
+        cls.battle_survey_dismiss_point = staticmethod(
+            battle_survey_dismiss_point
+        )
+        cls.ShipSelectionError = ShipSelectionError
+        cls.detect_selected_ship = staticmethod(detect_selected_ship)
+        cls.detect_port_mode = staticmethod(detect_port_mode)
+        cls.ensure_requested_mode = staticmethod(ensure_requested_mode)
+        cls.find_custom_ship_card = staticmethod(find_custom_ship_card)
+        cls.find_builtin_ship_card = staticmethod(find_builtin_ship_card)
+        cls.find_ship_card = staticmethod(find_ship_card)
+        cls.is_custom_ship_selected = staticmethod(is_custom_ship_selected)
+        cls.is_requested_ship_selected = staticmethod(is_requested_ship_selected)
+        cls.in_battle_type_selector = staticmethod(in_battle_type_selector)
+        cls.is_battle_survey_page = staticmethod(is_battle_survey_page)
+        cls.is_port_exit_confirmation_page = staticmethod(
+            is_port_exit_confirmation_page
+        )
+        cls.port_exit_confirmation_no_action_point = staticmethod(
+            port_exit_confirmation_no_action_point
+        )
+        cls.select_requested_ship = staticmethod(select_requested_ship)
+        cls.selected_ship_scores = staticmethod(selected_ship_scores)
+        cls.verify_builtin_ship_after_click = staticmethod(
+            _verify_builtin_ship_after_click
+        )
+
+    def backend(self, *tokens):
+        class Backend:
+            def recognize(_self, _image):
+                return list(tokens)
+
+        return Backend()
+
+    def test_detects_asymmetric_from_reference_port(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_ship_selected.png"))
+        self.assertEqual(self.detect_port_mode(image), "asymmetric")
+
+    def test_detects_cooperative_from_reference_port(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_mode_selector.png"))
+        self.assertEqual(self.detect_port_mode(image), "cooperative")
+
+    def test_exact_mode_ocr_rejects_random_as_cooperative(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_mode_selector.png"))
+        backend = self.backend(self.OcrToken("随机战", 0.99))
+
+        self.assertEqual(
+            self.detect_port_mode(image, backend=backend),
+            "random",
+        )
+
+    def test_exact_mode_ocr_confirms_cooperative(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_mode_selector.png"))
+        backend = self.backend(self.OcrToken("联合作战", 0.99))
+
+        self.assertEqual(
+            self.detect_port_mode(image, backend=backend),
+            "cooperative",
+        )
+
+    def test_normal_port_is_not_confused_with_battle_type_selector(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_mode_selector.png"))
+
+        self.assertFalse(self.in_battle_type_selector(image))
+
+    def test_open_battle_type_page_is_detected_from_asymmetric_card(self):
+        image = np.full((1600, 2560, 3), 70, dtype=np.uint8)
+        cv2.circle(image, (1580, 875), 60, (180, 30, 180), -1)
+
+        self.assertTrue(self.in_battle_type_selector(image))
+
+    def test_current_battle_type_page_fixture_is_detected(self):
+        image = cv2.imread(
+            str(self.FIXTURE_ROOT / "battle_type_selector_current.jpg")
+        )
+
+        self.assertTrue(self.in_battle_type_selector(image))
+
+    def test_battle_survey_requires_specific_question_and_close_action(self):
+        image = np.zeros((1000, 1600, 3), dtype=np.uint8)
+        survey = self.backend(
+            self.OcrToken("您对刚刚进行的这场战斗满意度如何？", 0.99),
+            self.OcrToken("非常不满意 不满意 一般 满意 非常满意", 0.98),
+            self.OcrToken("关闭", 0.99),
+        )
+        unrelated = self.backend(
+            self.OcrToken("返回港口", 0.99),
+            self.OcrToken("关闭", 0.99),
+        )
+
+        self.assertTrue(self.is_battle_survey_page(image, backend=survey))
+        self.assertFalse(self.is_battle_survey_page(image, backend=unrelated))
+
+    def test_battle_survey_accepts_evaluation_wording_and_locates_skip(self):
+        image = np.zeros((1000, 1600, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken("战斗评价", 0.98),
+            self.OcrToken("非常不满意 不满意 一般 满意 非常满意", 0.98),
+            self.OcrToken(
+                "跳过",
+                0.99,
+                ((900, 600), (980, 600), (980, 640), (900, 640)),
+            ),
+        )
+
+        self.assertTrue(self.is_battle_survey_page(image, backend=backend))
+        # Survey OCR crop begins at (224, 120).
+        self.assertEqual(
+            self.battle_survey_dismiss_point(image, backend=backend),
+            (1164, 740),
+        )
+
+    def test_port_exit_confirmation_requires_exact_heading_and_clicks_no(self):
+        image = np.zeros((1494, 2560, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken("确认", 0.99),
+            self.OcrToken("退出游戏？", 0.99),
+            self.OcrToken(
+                "是",
+                0.99,
+                ((1172, 718), (1199, 718), (1199, 747), (1172, 747)),
+            ),
+            self.OcrToken(
+                "否",
+                0.91,
+                ((1361, 718), (1391, 718), (1391, 748), (1361, 748)),
+            ),
+        )
+
+        self.assertTrue(
+            self.is_port_exit_confirmation_page(image, backend=backend)
+        )
+        self.assertEqual(
+            self.port_exit_confirmation_no_action_point(image, backend=backend),
+            (1376, 733),
+        )
+
+    def test_port_exit_confirmation_rejects_generic_yes_no_dialog(self):
+        image = np.zeros((1494, 2560, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken("确认", 0.99),
+            self.OcrToken("离开战斗？", 0.99),
+            self.OcrToken(
+                "否",
+                0.99,
+                ((1361, 718), (1391, 718), (1391, 748), (1361, 748)),
+            ),
+        )
+
+        self.assertFalse(
+            self.is_port_exit_confirmation_page(image, backend=backend)
+        )
+
+    def test_mode_card_click_point_comes_from_ocr_box(self):
+        image = np.zeros((1000, 1600, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken(
+                "联合作战",
+                0.99,
+                ((100, 200), (220, 200), (220, 240), (100, 240)),
+            )
+        )
+
+        point = self.find_mode_card_from_ocr(
+            image,
+            "cooperative",
+            backend,
+        )
+
+        # Search crop begins at (288, 200); click follows the OCR box centre,
+        # not a 2560x1440-specific hard-coded card coordinate.
+        self.assertEqual(point, (448, 420))
+
+    def test_mode_selection_page_must_close_before_coop_is_verified(self):
+        selector = np.full((1600, 2560, 3), 70, dtype=np.uint8)
+        cv2.circle(selector, (1580, 875), 60, (180, 30, 180), -1)
+        cooperative_port = cv2.imread(
+            str(self.FIXTURE_ROOT / "port_mode_selector.png")
+        )
+
+        class PortVision:
+            @staticmethod
+            def classify_screen(_image):
+                from core.ui import ScreenState
+
+                return ScreenState.PORT
+
+        with (
+            patch("port_navigator._capture", side_effect=[selector, cooperative_port]),
+            patch("port_navigator._click_local", return_value=True) as click,
+            patch("port_navigator.time.sleep", return_value=None),
+        ):
+            selected = self.ensure_requested_mode(
+                1,
+                "cooperative",
+                vision=PortVision(),
+            )
+
+        self.assertTrue(selected)
+        # Starting on the selector must click only the requested mode card; it
+        # must not click the port header again and accidentally close the page.
+        self.assertEqual(click.call_count, 1)
+
+    def test_finds_both_supported_ship_cards(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_ship_selected.png"))
+        for ship in ("pommern", "napoli"):
+            match = self.find_ship_card(image, ship)
+            self.assertIsNotNone(match, ship)
+            (x, y), score = match
+            self.assertGreater(score, 0.68)
+            self.assertTrue(0 <= x < image.shape[1])
+            self.assertTrue(int(image.shape[0] * 0.73) <= y < image.shape[0])
+
+    def test_builtin_ship_card_uses_exact_ocr_when_template_is_dimmed(self):
+        image = np.full((1440, 2560, 3), 35, dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken(
+                "那不勒斯",
+                0.49,
+                ((820, 150), (970, 150), (970, 185), (820, 185)),
+            )
+        )
+
+        match = self.find_builtin_ship_card(
+            image,
+            "napoli",
+            backend,
+            minimum_ocr_confidence=0.45,
+        )
+
+        self.assertIsNotNone(match)
+        (x, y), confidence = match
+        self.assertEqual((x, y), (895, 1157))
+        self.assertAlmostEqual(confidence, 0.49)
+
+    def test_selected_ship_accepts_exact_low_confidence_ocr_in_detail_panel(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken(
+                "那不勒斯",
+                0.50,
+                ((100, 80), (260, 80), (260, 115), (100, 115)),
+            )
+        )
+
+        self.assertEqual(
+            self.detect_selected_ship(image, backend=backend),
+            ("napoli", 0.50, "ocr_low_confidence"),
+        )
+
+    def test_ship_switch_verification_reads_right_upper_card_after_click(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken(
+                "那不勒斯",
+                0.50,
+                ((100, 80), (260, 80), (260, 115), (100, 115)),
+            )
+        )
+
+        class PortVision:
+            @staticmethod
+            def classify_screen(_image):
+                from core.ui import ScreenState
+
+                return ScreenState.PORT
+
+        with (
+            patch("port_navigator._capture", side_effect=[image, image]),
+            patch("port_navigator.time.sleep", return_value=None),
+        ):
+            verified = self.verify_builtin_ship_after_click(
+                1,
+                "napoli",
+                backend,
+                vision=PortVision(),
+            )
+
+        self.assertEqual(verified, (True, 0.50, "ocr_low_confidence"))
+
+    def test_rejects_unknown_ship(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        with self.assertRaises(ValueError):
+            self.find_ship_card(image, "unknown")
+
+    def test_no_commander_template_similarity_does_not_confirm_requested_ship(self):
+        image = np.zeros((1494, 2560, 3), dtype=np.uint8)
+        backend = self.backend(self.OcrToken(
+            "没有指挥官", 0.995,
+            ((100, 100), (250, 100), (250, 125), (100, 125)),
+        ))
+        with patch("port_navigator.selected_ship_scores", return_value={"pommern": 0.653, "napoli": 0.438}):
+            self.assertFalse(self.is_requested_ship_selected(
+                image, "pommern", minimum_score=0.64, minimum_margin=0.08, backend=backend,
+            ))
+
+    def test_unconfirmed_current_ship_clicks_target_before_commander_checks(self):
+        image = np.zeros((1494, 2560, 3), dtype=np.uint8)
+        backend = self.backend(self.OcrToken(
+            "没有指挥官", 0.995,
+            ((100, 100), (250, 100), (250, 125), (100, 125)),
+        ))
+
+        class PortVision:
+            @staticmethod
+            def classify_screen(_image):
+                from core.ui import ScreenState
+                return ScreenState.PORT
+
+        with (
+            patch("port_navigator._capture", return_value=image),
+            patch("port_navigator.selected_ship_scores", return_value={"pommern": 0.653, "napoli": 0.438}),
+            patch("port_navigator.find_builtin_ship_card", return_value=((773, 1325), 0.95)),
+            patch("port_navigator._click_local", return_value=True) as click,
+            patch("port_navigator._verify_builtin_ship_after_click", return_value=(True, 0.98, "ocr")) as verify,
+            patch("port_navigator._remember_selected_ship"),
+            patch("port_navigator.time.sleep"),
+        ):
+            self.assertTrue(self.select_requested_ship(1, "pommern", PortVision(), ocr_backend=backend))
+            click.assert_called_once_with(1, (773, 1325))
+            verify.assert_called_once()
+
+    def test_verifies_selected_ship_from_detail_panel(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_ship_selected.png"))
+        scores = self.selected_ship_scores(image)
+
+        self.assertGreater(scores["napoli"], 0.95)
+        self.assertLess(scores["pommern"], 0.55)
+        self.assertTrue(self.is_requested_ship_selected(image, "napoli"))
+        self.assertFalse(self.is_requested_ship_selected(image, "pommern"))
+
+    def test_selected_target_is_read_before_battle_hud_interlock(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_ship_selected.png"))
+
+        class ConflictingVision:
+            @staticmethod
+            def classify_screen(_image):
+                from core.ui import ScreenState
+
+                return ScreenState.PORT
+
+            @staticmethod
+            def _has_battle_hud(_image):
+                raise AssertionError("read-only selected-ship check must run first")
+
+        with (
+            patch("port_navigator._capture", return_value=image),
+            patch("port_navigator._scroll_ship_carousel_down") as scroll,
+            patch("port_navigator._click_local") as click,
+        ):
+            selected = self.select_requested_ship(
+                1,
+                "napoli",
+                ConflictingVision(),
+                ocr_backend=self.backend(),
+                require_port_action=True,
+            )
+
+        self.assertTrue(selected)
+        scroll.assert_not_called()
+        click.assert_not_called()
+
+    def test_finds_exact_custom_ship_name_from_split_ocr_tokens(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken(
+                "大选",
+                0.94,
+                ((800, 120), (850, 120), (850, 150), (800, 150)),
+            ),
+            self.OcrToken(
+                "帝侯",
+                0.92,
+                ((858, 120), (910, 120), (910, 150), (858, 150)),
+            ),
+        )
+        match = self.find_custom_ship_card(image, "大选帝侯", backend)
+        self.assertIsNotNone(match)
+        (x, y), confidence = match
+        self.assertTrue(800 <= x <= 910)
+        self.assertGreaterEqual(y, int(image.shape[0] * 0.735))
+        self.assertGreater(confidence, 0.9)
+
+    def test_custom_ship_name_requires_full_exact_match(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken(
+                "大选帝侯 B",
+                0.96,
+                ((800, 120), (940, 120), (940, 150), (800, 150)),
+            )
+        )
+        self.assertIsNone(self.find_custom_ship_card(image, "大选帝侯", backend))
+
+    def test_custom_ship_accepts_zieten_chinese_name_variant(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken(
+                "齐滕",
+                0.99,
+                ((1800, 120), (1850, 120), (1850, 150), (1800, 150)),
+            )
+        )
+        match = self.find_custom_ship_card(image, "齐藤", backend)
+        self.assertIsNotNone(match)
+        self.assertTrue(1800 <= match[0][0] <= 1850)
+
+        selected_backend = self.backend(
+            self.OcrToken(
+                "齐滕",
+                0.99,
+                ((100, 40), (150, 40), (150, 70), (100, 70)),
+            )
+        )
+        self.assertTrue(self.is_custom_ship_selected(image, "齐藤", selected_backend))
+
+    def test_selected_custom_ship_accepts_tier_prefix_only(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        tiered = self.backend(
+            self.OcrToken(
+                "IX 石见",
+                0.96,
+                ((100, 40), (210, 40), (210, 70), (100, 70)),
+            )
+        )
+        wrong_ship = self.backend(
+            self.OcrToken(
+                "IX 石见 B",
+                0.96,
+                ((100, 40), (240, 40), (240, 70), (100, 70)),
+            )
+        )
+        self.assertTrue(self.is_custom_ship_selected(image, "石见", tiered))
+        self.assertFalse(self.is_custom_ship_selected(image, "石见", wrong_ship))
+
+    def test_selected_latin_ship_starting_with_roman_letter_is_exact(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken(
+                "Vermont",
+                0.97,
+                ((100, 40), (220, 40), (220, 70), (100, 70)),
+            )
+        )
+        self.assertTrue(self.is_custom_ship_selected(image, "Vermont", backend))
+
+    def test_missing_custom_ship_raises_actionable_error(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+
+        class PortVision:
+            @staticmethod
+            def classify_screen(_image):
+                from core.ui import ScreenState
+
+                return ScreenState.PORT
+
+        with patch("port_navigator._capture", return_value=image):
+            with self.assertRaisesRegex(self.ShipSelectionError, "重新选择"):
+                self.select_requested_ship(
+                    None,
+                    "custom",
+                    PortVision(),
+                    custom_name="不存在的舰船",
+                    ocr_backend=self.backend(),
+                    custom_max_scrolls=0,
+                )
+
+    def test_strict_ship_selection_rejects_false_port_with_battle_hud(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+
+        class ConflictingVision:
+            @staticmethod
+            def classify_screen(_image):
+                from core.ui import ScreenState
+
+                return ScreenState.PORT
+
+            @staticmethod
+            def _has_battle_hud(_image):
+                return True
+
+        with (
+            patch("port_navigator._capture", return_value=image),
+            patch("port_navigator._scroll_ship_carousel_down") as scroll,
+            patch("port_navigator._click_local") as click,
+        ):
+            selected = self.select_requested_ship(
+                1,
+                "pommern",
+                ConflictingVision(),
+                ocr_backend=self.backend(),
+                require_port_action=True,
+            )
+
+        self.assertFalse(selected)
+        scroll.assert_not_called()
+        click.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

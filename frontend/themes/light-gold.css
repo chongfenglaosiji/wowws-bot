@@ -1,0 +1,1033 @@
+/* Light warm-grey system with gold accents.
+   Near-white surfaces, black typography, gold accent blocks, light-grey
+   differentiation and hairline rules. Cosmetic layer only: the three-column
+   layout, element sizes and spacing keep their original structure. No
+   transitions, animations, lifts or pulses. */
+
+:root {
+  --bg: #f5f6f7;
+  --surface: #ffffff;
+  --surface-2: #f4f5f6;
+  --glass: rgba(255, 255, 255, 0.86);
+  --glass-soft: rgba(255, 255, 255, 0.7);
+  --ink: #111315;
+  --ink-2: #3f444a;
+  --muted: #7c8288;
+  --faint: #a0a5aa;
+  --line: #e4e6e8;
+  --line-2: #d3d7da;
+  --accent: #d9b24c;
+  --accent-deep: #7a5c0a;
+  --red: #c1453b;
+  --radius: 8px;
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Inter", "HarmonyOS Sans SC", "MiSans", "PingFang SC",
+    "Microsoft YaHei UI", "Segoe UI", sans-serif;
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Faint contour rings in the top-right, like the reference page. */
+body::before {
+  content: "";
+  position: fixed;
+  right: -12%;
+  top: -26%;
+  width: 78%;
+  height: 86%;
+  z-index: -1;
+  pointer-events: none;
+  background: repeating-radial-gradient(
+    circle at 55% 45%,
+    transparent 0 26px,
+    rgba(17, 20, 23, 0.045) 27px 28px
+  );
+  -webkit-mask-image: radial-gradient(closest-side, #000 52%, transparent 78%);
+  mask-image: radial-gradient(closest-side, #000 52%, transparent 78%);
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--ink);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #c9cdd0 #eff1f2;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: #eff1f2;
+  border-radius: 8px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #c9cdd0;
+  border: 2px solid #eff1f2;
+  border-radius: 8px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #b2b7bb;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(217, 178, 76, 0.55);
+}
+
+/* ── Header ─────────────────────────────────────────────── */
+
+.masthead {
+  border-bottom: 1px solid var(--line);
+}
+
+.brand-monogram {
+  color: var(--accent);
+  background: var(--ink);
+  box-shadow: none;
+}
+
+.brand-lockup p {
+  color: var(--muted);
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+}
+
+.brand-lockup h1 {
+  color: var(--ink);
+  text-shadow: none;
+}
+
+.system-chip {
+  border: 1px solid var(--line);
+  background: var(--glass);
+  box-shadow: none;
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+}
+
+.system-chip .pulse {
+  background: #b9bec2;
+}
+
+.system-chip.live .pulse {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(217, 178, 76, 0.4);
+}
+
+.system-chip small {
+  color: var(--muted);
+}
+
+.system-chip strong {
+  color: var(--ink);
+}
+
+.system-chip time {
+  border-left: 1px solid var(--line);
+  color: var(--ink-2);
+}
+
+/* ── Cards ──────────────────────────────────────────────── */
+
+.deck-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--glass);
+  box-shadow: 0 1px 2px rgba(17, 20, 23, 0.03);
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+}
+
+.deck-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto auto 0;
+  width: 6px;
+  height: 44px;
+  background: var(--accent);
+  opacity: 1;
+}
+
+.section-title {
+  padding-bottom: 9px;
+  border-bottom: 1px solid var(--line);
+}
+
+.section-title > span {
+  border-right: 1px solid var(--line-2);
+  color: var(--ink);
+  letter-spacing: 0.08em;
+  text-shadow: none;
+}
+
+.section-title small {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+}
+
+.section-title h2 {
+  color: var(--ink);
+}
+
+.section-title em {
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink-2);
+}
+
+.section-title em.live {
+  border-color: var(--line);
+  background: var(--surface-2);
+  color: var(--ink-2);
+}
+
+/* Gold separator under the live header. */
+.live-card > .section-title {
+  border-bottom: 2px solid var(--accent);
+}
+
+/* ── Controls ───────────────────────────────────────────── */
+
+.control-group > label,
+.label-row label {
+  color: var(--ink-2);
+  letter-spacing: 0.1em;
+}
+
+.label-row span {
+  color: var(--muted);
+}
+
+.choice,
+.ship-choice {
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.choice:hover,
+.ship-choice:hover {
+  border-color: var(--ink);
+  background: var(--surface);
+}
+
+.choice.selected,
+.ship-choice.selected {
+  border-color: var(--ink);
+  background: var(--surface-2);
+  box-shadow: inset 3px 0 var(--accent);
+}
+
+.choice strong,
+.ship-choice b {
+  color: var(--ink);
+}
+
+.choice small,
+.ship-choice small,
+.ship-choice em {
+  color: var(--muted);
+}
+
+.choice small.detected,
+.launcher-choice small.detected {
+  color: var(--accent-deep);
+}
+
+.choice small.missing,
+.launcher-choice small.missing {
+  color: var(--red);
+}
+
+.stop-plan {
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+}
+
+.tab-switch {
+  background: #f1f2f3;
+  box-shadow: none;
+}
+
+.limit-tab {
+  color: var(--muted);
+}
+
+.limit-tab:hover {
+  color: var(--ink);
+}
+
+.limit-tab.active {
+  color: var(--accent);
+  background: var(--ink);
+  box-shadow: none;
+}
+
+.number-control button {
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.number-control button:hover {
+  border-color: var(--ink);
+  background: var(--ink);
+  color: var(--accent);
+}
+
+.number-control input {
+  border-bottom: 1px solid var(--ink);
+  color: var(--ink);
+}
+
+.number-control input:focus {
+  border-bottom-color: var(--accent-deep);
+  box-shadow: 0 2px 0 var(--accent);
+}
+
+.number-control > span {
+  color: var(--muted);
+}
+
+.stop-plan p,
+.microcopy {
+  color: var(--muted);
+}
+
+.readiness {
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.readiness > span {
+  background: var(--red);
+}
+
+.readiness strong {
+  color: var(--ink);
+}
+
+.readiness small {
+  color: var(--muted);
+}
+
+.readiness.ready {
+  border-color: var(--line);
+  background: var(--surface);
+}
+
+.readiness.ready > span {
+  background: var(--accent);
+  box-shadow: none;
+}
+
+.human-alert {
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+}
+
+.human-alert strong,
+.human-alert p {
+  color: var(--red);
+}
+
+.human-alert button {
+  border: 1px solid var(--ink);
+  background: var(--ink);
+  color: var(--accent);
+}
+
+/* ── Buttons ────────────────────────────────────────────── */
+
+.start-button {
+  color: #fff;
+  background: var(--ink);
+  box-shadow: none;
+}
+
+.start-button b {
+  color: var(--accent);
+}
+
+.start-button:hover:not(:disabled) {
+  background: #000;
+  filter: none;
+}
+
+.stop-button {
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: none;
+}
+
+.stop-button:hover:not(:disabled) {
+  background: var(--ink);
+  color: #fff;
+}
+
+.start-button:disabled,
+.stop-button:disabled {
+  filter: none;
+  opacity: 0.35;
+}
+
+/* ── Live status ────────────────────────────────────────── */
+
+.operation-banner {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.operation-banner small,
+.operation-copy small {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+}
+
+.operation-banner strong,
+.operation-copy strong {
+  color: var(--ink);
+  text-shadow: none;
+}
+
+.operation-banner p,
+.operation-copy p {
+  color: var(--ink-2);
+}
+
+.progress-panel {
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.progress-head small {
+  color: var(--muted);
+}
+
+.progress-head strong {
+  color: var(--ink);
+}
+
+.progress-track {
+  background: #eceeef;
+  box-shadow: none;
+}
+
+.progress-track span {
+  background: var(--ink);
+  box-shadow: inset -4px 0 var(--accent);
+}
+
+.progress-panel p {
+  color: var(--muted);
+}
+
+.progress-panel b {
+  color: var(--ink);
+}
+
+.telemetry-grid {
+  background: var(--line);
+}
+
+.telemetry-grid > div {
+  background: var(--surface);
+}
+
+.telemetry-grid > div:hover {
+  background: var(--surface-2);
+}
+
+.telemetry-grid small {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.telemetry-grid strong {
+  color: var(--ink);
+}
+
+/* ── Light tactical map ─────────────────────────────────── */
+
+.route-visual {
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  background:
+    repeating-linear-gradient(0deg, rgba(17, 20, 23, 0.055) 0 1px, transparent 1px 24px),
+    repeating-linear-gradient(90deg, rgba(17, 20, 23, 0.055) 0 1px, transparent 1px 24px),
+    #eceef0;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.route-ring {
+  border-color: #d8dcdf;
+}
+
+.route-line {
+  background: var(--ink);
+}
+
+.route-line i {
+  background: var(--accent);
+  box-shadow: none;
+}
+
+.route-node {
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+  color: var(--ink-2);
+}
+
+.route-node.goal {
+  border-color: var(--ink);
+  background: var(--ink);
+  color: var(--accent);
+}
+
+.ship-marker {
+  color: var(--ink);
+  text-shadow: none;
+}
+
+.map-center-marker {
+  color: var(--accent-deep);
+}
+
+.map-track {
+  background: var(--accent);
+}
+
+.capture-zone-marker {
+  border: 1px solid var(--ink);
+  background: rgba(217, 178, 76, 0.32);
+  color: var(--ink);
+}
+
+.enemy-marker {
+  color: var(--red);
+  text-shadow: none;
+}
+
+.radar-zone {
+  border: 1px solid #b9bec2;
+  background: rgba(255, 255, 255, 0.5);
+  color: var(--ink);
+  box-shadow: none;
+}
+
+.radar-zone.hostile {
+  color: var(--red);
+  border-color: rgba(193, 69, 59, 0.5);
+}
+
+.radar-zone.friendly {
+  color: var(--accent-deep);
+  border-color: rgba(217, 178, 76, 0.5);
+}
+
+.radar-zone.neutral {
+  color: var(--ink-2);
+}
+
+.radar-contact {
+  color: var(--red);
+  text-shadow: none;
+}
+
+.radar-island {
+  background: #e2e5e7;
+  border: 1px solid #c6cbce;
+  box-shadow: none;
+}
+
+/* ── Light log pane (no large black block) ──────────────── */
+
+.log-pane {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  box-shadow: none;
+}
+
+/* The live card carries its own higher-specificity dark panel rule. */
+.live-card > .log-pane {
+  border-color: var(--line);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.live-card > .log-pane .log-pane-heading {
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.live-card > .log-pane .log-pane-heading small {
+  color: var(--muted);
+}
+
+.live-card > .log-pane .log-pane-heading button {
+  border-color: var(--line-2);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.live-card > .log-pane pre {
+  background: var(--surface-2);
+  color: var(--ink-2);
+}
+
+.live-card > .run-id-line {
+  color: var(--muted);
+}
+
+.live-card > .run-id-line span {
+  color: var(--ink);
+}
+
+.log-pane-heading {
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+}
+
+.log-pane-heading small {
+  color: var(--muted);
+}
+
+.log-pane pre {
+  background: var(--surface-2);
+  color: var(--ink-2);
+}
+
+.log-pane pre::selection {
+  background: var(--accent);
+  color: var(--ink);
+}
+
+.log-pane-heading button {
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.log-pane-heading button:hover {
+  border-color: var(--ink);
+  color: var(--ink);
+}
+
+.log-pane-heading button:disabled {
+  opacity: 0.4;
+}
+
+.run-id-line {
+  color: var(--muted);
+}
+
+.run-id-line span {
+  color: var(--ink);
+}
+
+/* ── Totals and history ─────────────────────────────────── */
+
+.task-badge {
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+  color: var(--ink-2);
+}
+
+.task-badge.running {
+  color: var(--accent-deep);
+  border-color: rgba(217, 178, 76, 0.4);
+  background: var(--surface);
+}
+
+.task-badge.completed {
+  color: var(--ink);
+  border-color: var(--ink);
+  background: var(--accent);
+}
+
+.task-badge.failed {
+  color: var(--red);
+  border-color: rgba(193, 69, 59, 0.4);
+  background: var(--surface);
+}
+
+.task-note {
+  color: var(--muted);
+}
+
+.reward-total {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.reward-total::after {
+  content: "";
+  position: absolute;
+  right: 12px;
+  top: 12px;
+  width: 6px;
+  height: 6px;
+  border: 0;
+  border-radius: 0;
+  background: var(--accent);
+}
+
+.reward-total small {
+  color: var(--muted);
+}
+
+.reward-total strong {
+  color: var(--ink);
+  text-shadow: none;
+}
+
+.reward-total span {
+  color: var(--faint);
+}
+
+.reward-total.credits,
+.reward-total.ship-xp,
+.reward-total.free-xp,
+.reward-total.task-time {
+  border-color: var(--line);
+  background: var(--surface);
+}
+
+.reward-total.credits strong,
+.reward-total.free-xp strong,
+.reward-total.task-time strong {
+  color: var(--ink);
+}
+
+.task-history-heading {
+  border-bottom: 1px solid var(--line);
+}
+
+.task-history-heading strong {
+  color: var(--ink);
+}
+
+.task-history-heading span {
+  color: var(--muted);
+}
+
+.history-row {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+}
+
+.history-row:hover {
+  border-color: var(--line-2);
+  background: var(--surface-2);
+}
+
+.history-row strong {
+  color: var(--ink);
+}
+
+.history-row small {
+  color: var(--muted);
+}
+
+.history-rewards span {
+  border-left: 2px solid var(--line-2);
+  border-radius: 2px;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.history-rewards i {
+  color: var(--ink);
+}
+
+.history-rewards .history-credit {
+  border-left-color: var(--accent);
+}
+
+.history-rewards .history-ship-xp {
+  border-left-color: #b7bdc2;
+}
+
+.history-rewards .history-free-xp {
+  border-left-color: #b7bdc2;
+}
+
+.history-rewards .history-credit i,
+.history-rewards .history-free-xp i {
+  color: var(--ink);
+}
+
+.history-row b {
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+  color: var(--ink-2);
+}
+
+.history-row.victory b,
+.history-row.task.completed b {
+  border-color: var(--ink);
+  background: var(--accent);
+  color: var(--ink);
+}
+
+.history-row.defeat b,
+.history-row.task.failed b {
+  border-color: rgba(193, 69, 59, 0.45);
+  background: var(--surface);
+  color: var(--red);
+}
+
+.history-row.task.stopped b {
+  color: var(--muted);
+  background: var(--surface);
+}
+
+.history-row .history-error {
+  color: var(--red);
+}
+
+.history-quick-note {
+  color: var(--accent-deep) !important;
+}
+
+.history-empty {
+  color: var(--faint);
+}
+
+/* ── Toggles and ship selector ──────────────────────────── */
+
+.quick-battle-toggle {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+}
+
+.quick-battle-toggle:hover {
+  border-color: var(--line-2);
+}
+
+.quick-battle-toggle:has(input:checked) {
+  border-color: var(--ink);
+  background: var(--surface-2);
+}
+
+.quick-battle-toggle input {
+  accent-color: var(--ink);
+}
+
+.quick-battle-toggle b {
+  color: var(--ink);
+}
+
+.quick-battle-toggle small {
+  color: var(--muted);
+}
+
+.ship-selector-tabs {
+  background: #f1f2f3;
+  border-radius: 4px;
+}
+
+.ship-selector-tab {
+  color: var(--muted);
+  border-radius: 3px;
+}
+
+.ship-selector-tab:hover {
+  color: var(--ink);
+}
+
+.ship-selector-tab.active {
+  color: var(--accent);
+  background: var(--ink);
+}
+
+.ship-preset-scroll {
+  scrollbar-color: #c9cdd0 #eff1f2;
+}
+
+.ship-preset-scroll:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.ship-preset-scroll::-webkit-scrollbar-track {
+  background: #eff1f2;
+}
+
+.ship-preset-scroll::-webkit-scrollbar-thumb {
+  background: #c9cdd0;
+}
+
+.ship-page-controls {
+  color: var(--muted);
+}
+
+.ship-page-controls button {
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.ship-page-controls button:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.delete-preset-button {
+  border: 1px solid rgba(193, 69, 59, 0.35);
+  background: var(--surface);
+  color: var(--red);
+}
+
+.delete-preset-button:hover {
+  border-color: var(--red);
+  background: var(--surface);
+  color: var(--red);
+}
+
+.custom-ship-fields {
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.custom-ship-fields label {
+  color: var(--ink-2);
+}
+
+.custom-ship-fields input {
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.custom-ship-fields input:focus {
+  border-color: var(--ink);
+  box-shadow: 0 0 0 3px rgba(217, 178, 76, 0.45);
+}
+
+.custom-ship-fields .range-input span {
+  color: var(--muted);
+}
+
+.custom-ship-fields p {
+  color: var(--muted);
+}
+
+.save-preset-button {
+  border: 1px solid var(--ink);
+  background: var(--ink);
+  color: var(--accent);
+}
+
+.save-preset-button:hover {
+  border-color: var(--ink);
+  background: #000;
+  color: var(--accent);
+}
+
+/* ── OCR switch ─────────────────────────────────────────── */
+
+.ocr-toolbar {
+  color: var(--muted);
+}
+
+.ocr-toolbar-label {
+  color: var(--muted);
+}
+
+.ocr-toolbar-label.active {
+  color: var(--accent-deep);
+}
+
+.ocr-device-switch {
+  border: 1px solid var(--line);
+  background: #f1f2f3;
+  border-radius: 4px;
+}
+
+.ocr-device-switch button {
+  color: var(--muted);
+  background: transparent;
+}
+
+.ocr-device-switch button:hover {
+  color: var(--ink);
+  border-color: transparent;
+}
+
+.ocr-device-switch button[aria-pressed="true"] {
+  color: var(--accent);
+  background: var(--ink);
+}
+
+.ocr-device-switch button:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.live-section-title #liveBadge {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-2);
+}
+
+.live-section-title > div > small {
+  color: var(--muted);
+}
+
+/* ── Toast ──────────────────────────────────────────────── */
+
+.toast {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.94);
+  color: var(--ink);
+  box-shadow: 0 12px 30px rgba(17, 20, 23, 0.1);
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+}
+
+.toast.error {
+  border-left-color: var(--red);
+}
+
+/* Any live-minimap variant keeps the same light-grey tactical surface. */
+.route-visual.has-live-minimap {
+  background: #eceef0;
+}

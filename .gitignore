@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+env/
+.venv/
+.venv_backup_*/
+
+# Logs & snapshots
+*.log
+!tests/fixtures/wgc_cold_start_20261012.log
+snapshots/
+debug/
+data/
+runtime/
+training_assets/
+/*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Secrets
+*.env
+credentials/

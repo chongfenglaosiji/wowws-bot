@@ -1,0 +1,1735 @@
+"""Local HTTP control panel for the World of Warships automation runner."""
+
+from __future__ import annotations
+
+import ctypes
+import ctypes.wintypes
+import json
+import logging
+import os
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import webbrowser
+from http import HTTPStatus
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import yaml
+
+from core import updater
+from core.calibration import CalibrationStore
+from core.launcher import launcher_statuses, normalize_launch_client, last_launch_client, remember_launch_client
+from core.window import find_game_window
+from web_workflow import WebCalibrationWorkflow, game_status
+
+logger = logging.getLogger("control")
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "frontend"
+DATA_DIR = BASE_DIR / "data"
+DB_PATH = Path(os.environ.get("WOWS_CONTROL_DB", DATA_DIR / "control_panel.db"))
+INSTANCE_PATH = DATA_DIR / "control_server.json"
+STATE_PATH = DATA_DIR / "runtime_state.json"
+STOP_PATH = DATA_DIR / "stop.request"
+PAUSE_PATH = DATA_DIR / "pause.request"
+RESUME_PATH = DATA_DIR / "resume.request"
+LOG_PATH = DATA_DIR / "runtime.log"
+CUSTOM_SHIP_PATH = DATA_DIR / "custom_ship.json"
+CUSTOM_SHIP_PRESETS_PATH = DATA_DIR / "custom_ship_presets.json"
+SCREENSHOT_ROOT = BASE_DIR / "runtime" / "screenshots"
+SCREENSHOT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+CUSTOM_SHIP_LOCK = threading.Lock()
+MODES = {
+    "cooperative": "联合作战",
+    "asymmetric": "非对称作战",
+}
+SUPPORTED_SHIPS = ("pommern", "napoli")
+CUSTOM_SHIP_KEY = "custom"
+RESOURCES = (
+    "credits",
+    "ship_xp",
+    "commander_xp",
+    "coal",
+    "steel",
+    "doubloons",
+    "free_xp",
+    "elite_xp",
+)
+
+
+class ElevationRequiredError(RuntimeError):
+    """The verified game process has a higher Windows integrity level."""
+
+
+class _TOKEN_ELEVATION(ctypes.Structure):
+    _fields_ = (("TokenIsElevated", ctypes.wintypes.DWORD),)
+
+
+def current_process_is_elevated() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
+
+
+def process_is_elevated(process_id: int) -> bool | None:
+    """Return a process elevation flag, or ``None`` when it cannot be read."""
+    if os.name != "nt" or not process_id:
+        return False
+    process_handle = 0
+    token_handle = ctypes.wintypes.HANDLE()
+    try:
+        kernel32 = ctypes.windll.kernel32
+        advapi32 = ctypes.windll.advapi32
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.DWORD,
+        )
+        open_process.restype = ctypes.wintypes.HANDLE
+        process_handle = open_process(
+            0x1000,  # PROCESS_QUERY_LIMITED_INFORMATION
+            False,
+            int(process_id),
+        )
+        if not process_handle:
+            return None
+        if not advapi32.OpenProcessToken(
+            process_handle,
+            0x0008,  # TOKEN_QUERY
+            ctypes.byref(token_handle),
+        ):
+            return None
+        elevation = _TOKEN_ELEVATION()
+        returned = ctypes.wintypes.DWORD()
+        if not advapi32.GetTokenInformation(
+            token_handle,
+            20,  # TokenElevation
+            ctypes.byref(elevation),
+            ctypes.sizeof(elevation),
+            ctypes.byref(returned),
+        ):
+            return None
+        return bool(elevation.TokenIsElevated)
+    except (AttributeError, OSError, ValueError):
+        return None
+    finally:
+        try:
+            if token_handle.value:
+                ctypes.windll.kernel32.CloseHandle(token_handle)
+            if process_handle:
+                ctypes.windll.kernel32.CloseHandle(process_handle)
+        except (AttributeError, OSError):
+            pass
+
+
+def running_game_requires_elevation(
+    *,
+    window_finder=find_game_window,
+    elevation_reader=process_is_elevated,
+) -> bool:
+    """Only flag a confirmed integrity mismatch with the verified game HWND."""
+    if os.name != "nt" or current_process_is_elevated():
+        return False
+    windows = window_finder()
+    if not windows:
+        return False
+    hwnd, _title, rect = max(
+        windows,
+        key=lambda item: max(0, item[2][2] - item[2][0])
+        * max(0, item[2][3] - item[2][1]),
+    )
+    process_id = ctypes.wintypes.DWORD()
+    user32 = ctypes.windll.user32
+    get_thread_window = user32.GetWindowThreadProcessId
+    # Without explicit argtypes the 64-bit HWND would be truncated to 32 bits.
+    get_thread_window.argtypes = (
+        ctypes.wintypes.HWND,
+        ctypes.POINTER(ctypes.wintypes.DWORD),
+    )
+    get_thread_window.restype = ctypes.wintypes.DWORD
+    get_thread_window(int(hwnd), ctypes.byref(process_id))
+    return elevation_reader(int(process_id.value or 0)) is True
+
+
+def request_elevated_control_server() -> bool:
+    """Launch one elevated replacement after a confirmed input mismatch."""
+    if os.name != "nt" or current_process_is_elevated():
+        return False
+    shell32 = ctypes.windll.shell32
+    execute = shell32.ShellExecuteW
+    execute.argtypes = (
+        ctypes.wintypes.HWND,
+        ctypes.wintypes.LPCWSTR,
+        ctypes.wintypes.LPCWSTR,
+        ctypes.wintypes.LPCWSTR,
+        ctypes.wintypes.LPCWSTR,
+        ctypes.c_int,
+    )
+    execute.restype = ctypes.wintypes.HINSTANCE
+    script = str(Path(__file__).resolve())
+    arguments = subprocess.list2cmdline(
+        [script, "--no-browser", "--wait-for-port"]
+    )
+    result = execute(
+        None,
+        "runas",
+        sys.executable,
+        arguments,
+        str(BASE_DIR),
+        0,  # SW_HIDE; the browser is the user-facing console.
+    )
+    if int(result) <= 32:
+        raise OSError("控制台需要管理员权限才能向当前游戏发送输入；请允许 UAC 提示")
+    return True
+
+
+def ensure_elevated_control_server() -> bool:
+    """Run normally by default; keep explicit forced elevation for recovery."""
+    if os.name != "nt" or os.environ.get("WOWS_PANEL_FORCE_ELEVATION") != "1":
+        return True
+    if current_process_is_elevated():
+        return True
+    return not request_elevated_control_server()
+
+
+def validate_custom_ship(payload, *, allow_empty_name=False):
+    name = str(payload.get("custom_ship_name", "")).strip()
+    if (
+        (not name and not allow_empty_name)
+        or len(name) > 64
+        or any(character in name for character in "\r\n\t")
+    ):
+        raise ValueError("请输入完整的舰船名称（最多 64 个字符）")
+    try:
+        secondary_range = float(payload.get("custom_secondary_range", 0))
+    except (TypeError, ValueError) as error:
+        raise ValueError("副炮射程必须是数字") from error
+    if not 1.0 <= secondary_range <= 30.0:
+        raise ValueError("副炮射程必须在 1.0 到 30.0 km 之间")
+    return name, secondary_range
+
+
+def load_custom_ship():
+    try:
+        payload = json.loads(CUSTOM_SHIP_PATH.read_text(encoding="utf-8"))
+        name, secondary_range = validate_custom_ship(
+            payload,
+            allow_empty_name=True,
+        )
+        return {"name": name, "secondary_range": secondary_range}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {"name": "", "secondary_range": 10.0}
+
+
+def save_custom_ship(name, secondary_range):
+    with CUSTOM_SHIP_LOCK:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temporary = CUSTOM_SHIP_PATH.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "custom_ship_name": name,
+                    "custom_secondary_range": secondary_range,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(CUSTOM_SHIP_PATH)
+
+
+def load_custom_ship_presets():
+    """Load reusable custom-ship choices without trusting persisted JSON."""
+    try:
+        payload = json.loads(CUSTOM_SHIP_PRESETS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    presets = []
+    seen_ids = set()
+    for item in payload[:50]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            name, secondary_range = validate_custom_ship(
+                {
+                    "custom_ship_name": item.get("name", ""),
+                    "custom_secondary_range": item.get("secondary_range", 0),
+                }
+            )
+        except ValueError:
+            continue
+        preset_id = str(item.get("id", "")).strip()
+        if (
+            not preset_id
+            or len(preset_id) > 40
+            or not all(character.isalnum() or character in "-_" for character in preset_id)
+            or preset_id in seen_ids
+        ):
+            continue
+        seen_ids.add(preset_id)
+        presets.append(
+            {
+                "id": preset_id,
+                "name": name,
+                "secondary_range": secondary_range,
+            }
+        )
+    return presets
+
+
+def resolve_custom_ship_for_run(payload):
+    """Resolve the immutable custom ship selected for a new worker process.
+
+    A preset id is authoritative over editable form fields and the last custom
+    ship file.  This prevents stale data such as ``石见`` from replacing the
+    preset the player actually clicked, such as ``冯·祖克霍夫``.
+    """
+    requested_preset_id = str(payload.get("custom_ship_preset_id", "")).strip()
+    if not requested_preset_id:
+        return validate_custom_ship(payload)
+    preset = next(
+        (
+            item
+            for item in load_custom_ship_presets()
+            if item["id"] == requested_preset_id
+        ),
+        None,
+    )
+    if preset is None:
+        raise ValueError("所选舰船预设不存在，请重新选择")
+    return preset["name"], float(preset["secondary_range"])
+
+
+def save_custom_ship_preset(name, secondary_range, preset_id=""):
+    """Create or update a reusable custom ship and return the full list."""
+    name, secondary_range = validate_custom_ship(
+        {
+            "custom_ship_name": name,
+            "custom_secondary_range": secondary_range,
+        }
+    )
+    requested_id = str(preset_id or "").strip()
+    if requested_id and (
+        len(requested_id) > 40
+        or not all(character.isalnum() or character in "-_" for character in requested_id)
+    ):
+        raise ValueError("舰船预设编号无效")
+    with CUSTOM_SHIP_LOCK:
+        presets = load_custom_ship_presets()
+        normalized_name = name.casefold()
+        existing = next(
+            (
+                item
+                for item in presets
+                if item["id"] == requested_id
+                or item["name"].casefold() == normalized_name
+            ),
+            None,
+        )
+        if existing is None:
+            existing = {
+                "id": uuid.uuid4().hex[:12],
+                "name": name,
+                "secondary_range": secondary_range,
+            }
+            presets.append(existing)
+        else:
+            existing["name"] = name
+            existing["secondary_range"] = secondary_range
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temporary = CUSTOM_SHIP_PRESETS_PATH.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(presets, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(CUSTOM_SHIP_PRESETS_PATH)
+        return dict(existing), presets
+
+
+def delete_custom_ship_preset(preset_id):
+    """Delete one custom preset by its stable id; built-ins are never touched."""
+    requested_id = str(preset_id or "").strip()
+    if (
+        not requested_id
+        or len(requested_id) > 40
+        or not all(character.isalnum() or character in "-_" for character in requested_id)
+    ):
+        raise ValueError("舰船预设编号无效")
+    with CUSTOM_SHIP_LOCK:
+        presets = load_custom_ship_presets()
+        remaining = [item for item in presets if item["id"] != requested_id]
+        if len(remaining) == len(presets):
+            raise ValueError("未找到要删除的舰船预设")
+        CUSTOM_SHIP_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = CUSTOM_SHIP_PRESETS_PATH.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(remaining, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(CUSTOM_SHIP_PRESETS_PATH)
+        return remaining
+
+
+class ControlStore:
+    def __init__(self, path: Path = DB_PATH):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(path, check_same_thread=False)
+        self.connection.row_factory = sqlite3.Row
+        self.lock = threading.Lock()
+        self._initialize()
+
+    def _initialize(self):
+        with self.connection:
+            self.connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS runs (
+                    id TEXT PRIMARY KEY,
+                    ship TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    limit_type TEXT NOT NULL,
+                    limit_value REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at REAL NOT NULL,
+                    ended_at REAL
+                );
+                CREATE TABLE IF NOT EXISTS resource_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    round_no INTEGER NOT NULL DEFAULT 0,
+                    credits INTEGER NOT NULL DEFAULT 0,
+                    ship_xp INTEGER NOT NULL DEFAULT 0,
+                    commander_xp INTEGER NOT NULL DEFAULT 0,
+                    coal INTEGER NOT NULL DEFAULT 0,
+                    steel INTEGER NOT NULL DEFAULT 0,
+                    doubloons INTEGER NOT NULL DEFAULT 0,
+                    free_xp INTEGER NOT NULL DEFAULT 0,
+                    elite_xp INTEGER NOT NULL DEFAULT 0,
+                    note TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                );
+                CREATE TABLE IF NOT EXISTS battle_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    round_no INTEGER NOT NULL,
+                    outcome TEXT NOT NULL DEFAULT 'unknown',
+                    credits INTEGER NOT NULL DEFAULT 0,
+                    ship_xp INTEGER NOT NULL DEFAULT 0,
+                    free_xp INTEGER NOT NULL DEFAULT 0,
+                    rewards_recognized INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    UNIQUE(run_id, round_no),
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                );
+                """
+            )
+            columns = {
+                row[1]
+                for row in self.connection.execute(
+                    "PRAGMA table_info(resource_entries)"
+                )
+            }
+            for column in ("ship_xp", "commander_xp"):
+                if column not in columns:
+                    self.connection.execute(
+                        f"ALTER TABLE resource_entries ADD COLUMN {column} "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
+            if "source" not in columns:
+                self.connection.execute(
+                    "ALTER TABLE resource_entries ADD COLUMN source "
+                    "TEXT NOT NULL DEFAULT 'manual'"
+                )
+            run_columns = {
+                row[1]
+                for row in self.connection.execute("PRAGMA table_info(runs)")
+            }
+            if "completed_rounds" not in run_columns:
+                self.connection.execute(
+                    "ALTER TABLE runs ADD COLUMN completed_rounds "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "duration_seconds" not in run_columns:
+                self.connection.execute(
+                    "ALTER TABLE runs ADD COLUMN duration_seconds "
+                    "REAL NOT NULL DEFAULT 0"
+                )
+            if "quick_battle" not in run_columns:
+                self.connection.execute(
+                    "ALTER TABLE runs ADD COLUMN quick_battle "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "resume_config" not in run_columns:
+                self.connection.execute(
+                    "ALTER TABLE runs ADD COLUMN resume_config TEXT NOT NULL DEFAULT ''"
+                )
+            if "last_error" not in run_columns:
+                self.connection.execute(
+                    "ALTER TABLE runs ADD COLUMN last_error TEXT NOT NULL DEFAULT ''"
+                )
+            if "abandoned" not in run_columns:
+                self.connection.execute(
+                    "ALTER TABLE runs ADD COLUMN abandoned INTEGER NOT NULL DEFAULT 0"
+                )
+                # Before this distinction existed, 'stopped' was reached by
+                # the explicit Terminate button. Do not silently offer those
+                # historical tasks as the primary continuation target.
+                self.connection.execute(
+                    "UPDATE runs SET abandoned = 1 WHERE status = 'stopped'"
+                )
+            # Preserve useful history created before progress columns existed.
+            self.connection.execute(
+                """UPDATE runs SET completed_rounds = COALESCE(
+                       (SELECT MAX(round_no) FROM resource_entries e
+                        WHERE e.run_id = runs.id AND e.round_no > 0), 0)
+                   WHERE completed_rounds = 0"""
+            )
+            self.connection.execute(
+                """UPDATE runs SET duration_seconds = MAX(0, ended_at - started_at)
+                   WHERE duration_seconds = 0 AND ended_at IS NOT NULL"""
+            )
+            # The saved settlement ledger is authoritative for the round count.
+            # A crashed or resumed runner used to leave completed_rounds below
+            # the rows actually recorded, so the dashboard showed too few 局.
+            self.connection.execute(
+                """UPDATE runs SET completed_rounds =
+                     (SELECT COUNT(*) FROM battle_history h
+                      WHERE h.run_id = runs.id)
+                   WHERE completed_rounds <
+                     (SELECT COUNT(*) FROM battle_history h
+                      WHERE h.run_id = runs.id)"""
+            )
+            # Poll replays inflated the AUTOINCREMENT counters far past the
+            # real row count; reset them to the highest live id.
+            for table in ("battle_history", "resource_entries"):
+                self.connection.execute(
+                    f"""UPDATE sqlite_sequence
+                        SET seq = (SELECT COALESCE(MAX(id), 0) FROM {table})
+                        WHERE name = '{table}'
+                          AND seq > (SELECT COALESCE(MAX(id), 0) FROM {table})"""
+                )
+
+    def close(self):
+        with self.lock:
+            self.connection.close()
+
+    def create_run(
+        self,
+        run_id,
+        ship,
+        mode,
+        limit_type,
+        limit_value,
+        *,
+        quick_battle=False,
+        resume_config=None,
+    ):
+        with self.lock, self.connection:
+            self.connection.execute(
+                """INSERT INTO runs
+                   (id, ship, mode, limit_type, limit_value, status,
+                    started_at, ended_at, completed_rounds, duration_seconds,
+                    quick_battle, resume_config)
+                   VALUES (?, ?, ?, ?, ?, 'running', ?, NULL, 0, 0, ?, ?)""",
+                (
+                    run_id,
+                    ship,
+                    mode,
+                    limit_type,
+                    limit_value,
+                    time.time(),
+                    1 if quick_battle else 0,
+                    json.dumps(resume_config or {}, ensure_ascii=False),
+                ),
+            )
+
+    def update_run_progress(self, run_id, completed_rounds, duration_seconds):
+        if not run_id:
+            return
+        with self.lock, self.connection:
+            self.connection.execute(
+                """UPDATE runs SET completed_rounds = MAX(completed_rounds, ?),
+                   duration_seconds = MAX(duration_seconds, ?)
+                   WHERE id = ?""",
+                (
+                    max(0, int(completed_rounds or 0)),
+                    max(0.0, float(duration_seconds or 0.0)),
+                    run_id,
+                ),
+            )
+
+    def update_run_quick_battle(self, run_id, quick_battle):
+        if not run_id:
+            return
+        with self.lock, self.connection:
+            self.connection.execute(
+                "UPDATE runs SET quick_battle = ? WHERE id = ?",
+                (1 if quick_battle else 0, run_id),
+            )
+
+    def get_run(self, run_id):
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT * FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def get_resume_candidate(self):
+        """Only the most recently started task can own the main Continue key."""
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT * FROM runs ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+            if row is None or row["status"] not in {"failed", "stopped"} or row["abandoned"]:
+                return None
+            if row["limit_type"] == "rounds" and row["completed_rounds"] >= row["limit_value"]:
+                return None
+            if row["limit_type"] == "duration" and row["duration_seconds"] >= row["limit_value"] * 60:
+                return None
+            return dict(row)
+
+    def abandon_run(self, run_id):
+        with self.lock, self.connection:
+            self.connection.execute(
+                "UPDATE runs SET abandoned = 1 WHERE id = ?", (run_id,)
+            )
+
+    def reopen_run(self, run_id, resume_config=None):
+        with self.lock, self.connection:
+            cursor = self.connection.execute(
+                """UPDATE runs SET status = 'running', ended_at = NULL,
+                   last_error = '', resume_config = ?
+                   WHERE id = ? AND status IN ('failed', 'stopped')
+                   AND abandoned = 0""",
+                (json.dumps(resume_config or {}, ensure_ascii=False), run_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("任务已无法接续，请刷新任务列表")
+
+    def finish_run(self, run_id, status, *, error=""):
+        with self.lock, self.connection:
+            # The recorded settlement count is authoritative. A crashed or
+            # resumed runner can report fewer rounds than its own ledger.
+            self.connection.execute(
+                """UPDATE runs SET status = ?, ended_at = ?, last_error = ?,
+                   completed_rounds = MAX(completed_rounds,
+                     (SELECT COUNT(*) FROM battle_history h
+                      WHERE h.run_id = runs.id))
+                   WHERE id = ?""",
+                (status, time.time(), str(error or "")[:500], run_id),
+            )
+
+    def add_resources(self, run_id, round_no, values, note, *, source="manual"):
+        amounts = [int(values.get(name, 0) or 0) for name in RESOURCES]
+        with self.lock, self.connection:
+            cursor = self.connection.execute(
+                """INSERT INTO resource_entries
+                   (run_id, round_no, credits, ship_xp, commander_xp,
+                    coal, steel, doubloons, free_xp, elite_xp,
+                    note, source, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    int(round_no or 0),
+                    *amounts,
+                    note[:200],
+                    str(source)[:50],
+                    time.time(),
+                ),
+            )
+            return cursor.lastrowid
+
+    def upsert_auto_rewards(self, run_id, round_no, values):
+        """Record one OCR result per run/round without polling duplicates."""
+        amounts = [int(values.get(name, 0) or 0) for name in RESOURCES]
+        round_no = int(round_no or 0)
+        if not run_id or round_no <= 0 or not any(amounts):
+            return None
+        with self.lock, self.connection:
+            run = self.connection.execute(
+                "SELECT quick_battle FROM runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if run and bool(run["quick_battle"]):
+                logger.info("快速战斗不写入收益: run=%s round=%s", run_id, round_no)
+                return None
+            existing = self.connection.execute(
+                """SELECT id, credits, ship_xp, commander_xp, coal, steel,
+                          doubloons, free_xp, elite_xp
+                   FROM resource_entries
+                   WHERE run_id = ? AND round_no = ? AND source = 'auto_result_ocr'
+                   LIMIT 1""",
+                (run_id, round_no),
+            ).fetchone()
+            if existing:
+                current = [existing[name] for name in RESOURCES]
+                if current != amounts:
+                    self.connection.execute(
+                        """UPDATE resource_entries SET
+                           credits=?, ship_xp=?, commander_xp=?, coal=?, steel=?,
+                           doubloons=?, free_xp=?, elite_xp=?
+                           WHERE id=?""",
+                        (*amounts, existing["id"]),
+                    )
+                # created_at marks the first observation of this settlement;
+                # the control panel replays the whole ledger on every poll and
+                # must not rewrite history timestamps.
+                return existing["id"]
+            cursor = self.connection.execute(
+                """INSERT INTO resource_entries
+                   (run_id, round_no, credits, ship_xp, commander_xp,
+                    coal, steel, doubloons, free_xp, elite_xp,
+                    note, source, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    round_no,
+                    *amounts,
+                    "结算页 OCR 自动统计",
+                    "auto_result_ocr",
+                    time.time(),
+                ),
+            )
+            return cursor.lastrowid
+
+    def upsert_battle_result(
+        self,
+        run_id,
+        round_no,
+        outcome,
+        values=None,
+        *,
+        rewards_recognized=False,
+    ):
+        """Keep one auditable result row for every confirmed concluded battle."""
+        round_no = int(round_no or 0)
+        if not run_id or round_no <= 0:
+            return None
+        outcome = str(outcome or "unknown").strip().lower()
+        if outcome not in {"victory", "defeat", "unknown"}:
+            outcome = "unknown"
+        values = values if isinstance(values, dict) else {}
+        amounts = (
+            max(0, int(values.get("credits", 0) or 0)),
+            max(0, int(values.get("ship_xp", 0) or 0)),
+            max(0, int(values.get("free_xp", 0) or 0)),
+        )
+        with self.lock, self.connection:
+            run = self.connection.execute(
+                "SELECT quick_battle FROM runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if run and bool(run["quick_battle"]):
+                logger.info("快速战斗不写入胜负/收益历史: run=%s round=%s", run_id, round_no)
+                return None
+            # The control panel replays the complete reward ledger on every
+            # poll.  A UPSERT would bump the AUTOINCREMENT sequence and rewrite
+            # created_at on each replay (the sequence had grown past 400k for a
+            # few hundred rows).  Update only real changes instead.
+            existing = self.connection.execute(
+                """SELECT id, outcome, credits, ship_xp, free_xp,
+                          rewards_recognized
+                   FROM battle_history
+                   WHERE run_id = ? AND round_no = ?""",
+                (run_id, round_no),
+            ).fetchone()
+            if existing is not None:
+                merged_outcome = (
+                    existing["outcome"] if outcome == "unknown" else outcome
+                )
+                current = (
+                    existing["credits"], existing["ship_xp"], existing["free_xp"],
+                )
+                recognized = 1 if rewards_recognized else 0
+                if (
+                    merged_outcome == existing["outcome"]
+                    and current == amounts
+                    and recognized == existing["rewards_recognized"]
+                ):
+                    return existing["id"]
+                self.connection.execute(
+                    """UPDATE battle_history SET
+                       outcome=?, credits=?, ship_xp=?, free_xp=?,
+                       rewards_recognized=?
+                       WHERE id=?""",
+                    (merged_outcome, *amounts, recognized, existing["id"]),
+                )
+                return existing["id"]
+            cursor = self.connection.execute(
+                """INSERT INTO battle_history
+                   (run_id, round_no, outcome, credits, ship_xp, free_xp,
+                    rewards_recognized, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    round_no,
+                    outcome,
+                    *amounts,
+                    1 if rewards_recognized else 0,
+                    time.time(),
+                ),
+            )
+            return cursor.lastrowid
+
+    def dashboard(self):
+        with self.lock:
+            totals = dict(
+                self.connection.execute(
+                    """SELECT COUNT(*) AS entries,
+                    COALESCE(SUM(credits), 0) AS credits,
+                    COALESCE(SUM(ship_xp), 0) AS ship_xp,
+                    COALESCE(SUM(commander_xp), 0) AS commander_xp,
+                    COALESCE(SUM(coal), 0) AS coal,
+                    COALESCE(SUM(steel), 0) AS steel,
+                    COALESCE(SUM(doubloons), 0) AS doubloons,
+                    COALESCE(SUM(free_xp), 0) AS free_xp,
+                    COALESCE(SUM(elite_xp), 0) AS elite_xp
+                    FROM resource_entries e
+                    JOIN runs r ON r.id = e.run_id
+                    WHERE COALESCE(r.quick_battle, 0) = 0"""
+                ).fetchone()
+            )
+            run_totals = dict(
+                self.connection.execute(
+                    """SELECT COUNT(*) AS tasks,
+                    COALESCE(SUM(completed_rounds), 0) AS completed_rounds,
+                    COALESCE(SUM(duration_seconds), 0) AS duration_seconds
+                    FROM runs"""
+                ).fetchone()
+            )
+            totals.update(run_totals)
+            runs = [
+                dict(row)
+                for row in self.connection.execute(
+                    """SELECT r.*,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.credits ELSE 0 END), 0) AS credits,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.ship_xp ELSE 0 END), 0) AS ship_xp,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.commander_xp ELSE 0 END), 0) AS commander_xp,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.coal ELSE 0 END), 0) AS coal,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.steel ELSE 0 END), 0) AS steel,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.doubloons ELSE 0 END), 0) AS doubloons,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.free_xp ELSE 0 END), 0) AS free_xp,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.elite_xp ELSE 0 END), 0) AS elite_xp,
+                    (SELECT COUNT(*) FROM battle_history h
+                     WHERE h.run_id = r.id AND h.outcome = 'victory') AS victories,
+                    (SELECT COUNT(*) FROM battle_history h
+                     WHERE h.run_id = r.id AND h.outcome = 'defeat') AS defeats
+                    FROM runs r LEFT JOIN resource_entries e ON e.run_id = r.id
+                    GROUP BY r.id ORDER BY r.started_at DESC LIMIT 20"""
+                )
+            ]
+            history = [
+                dict(row)
+                for row in self.connection.execute(
+                    """SELECT * FROM battle_history
+                       ORDER BY created_at DESC LIMIT 100"""
+                )
+            ]
+        return {"totals": totals, "runs": runs, "history": history}
+
+
+class RunnerManager:
+    def __init__(self, store: ControlStore):
+        self.store = store
+        self.process = None
+        self.run_id = None
+        self.log_stream = None
+        self.lock = threading.Lock()
+
+    def _reconcile(self):
+        if self.process is None or self.process.poll() is None:
+            return
+        runtime_state = self._read_runtime_state()
+        if runtime_state.get("run_id") != self.run_id:
+            runtime_state = {}
+        final_state = str(runtime_state.get("state") or "")
+        status = (
+            final_state
+            if final_state in {"completed", "stopped", "failed"}
+            else "completed"
+            if self.process.returncode == 0
+            else "failed"
+        )
+        if self.run_id:
+            self.store.update_run_progress(
+                self.run_id,
+                runtime_state.get("completed_rounds", 0),
+                runtime_state.get("elapsed_seconds", 0),
+            )
+            error = runtime_state.get("error", "")
+            if status == "failed" and not error:
+                error = f"运行进程异常退出（退出码 {self.process.returncode}），详见归档日志"
+            self.store.finish_run(self.run_id, status, error=error)
+        if self.log_stream:
+            self.log_stream.close()
+        if status == "failed" and self.run_id and LOG_PATH.exists():
+            try:
+                archive = DATA_DIR / "run_logs"
+                archive.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(LOG_PATH, archive / f"{self.run_id}.log")
+            except OSError:
+                logger.warning("失败任务日志归档失败", exc_info=True)
+        self.process = None
+        self.log_stream = None
+
+    @staticmethod
+    def _read_runtime_state():
+        if not STATE_PATH.exists():
+            return {}
+        try:
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _watch_stop_request(self, process):
+        """Escalate a cooperative stop if the runner cannot exit promptly."""
+        try:
+            # The runner polls stop.request at every lifecycle gate and should
+            # normally release controls in under a second. Do not leave an OCR
+            # or stale-window loop owning the task for another 12 seconds.
+            process.wait(timeout=3)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        if process.poll() is None:
+            try:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                if process.poll() is None:
+                    process.terminate()
+
+    def start(self, payload):
+        with self.lock:
+            self._reconcile()
+            if self.process is not None:
+                raise RuntimeError("已有任务正在运行")
+            resume_run_id = str(payload.get("resume_run_id") or "").strip()
+            pending_run = self.store.get_resume_candidate()
+            resume_row = None
+            if resume_run_id:
+                if pending_run is not None and pending_run["id"] != resume_run_id:
+                    raise ValueError("请先继续或终止当前中断的任务")
+                resume_row = self.store.get_run(resume_run_id)
+                if (
+                    resume_row is None
+                    or resume_row["status"] not in {"failed", "stopped"}
+                    or resume_row["abandoned"]
+                ):
+                    raise ValueError("仅能接续已停止或异常结束的任务")
+                try:
+                    saved = json.loads(resume_row.get("resume_config") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    saved = {}
+                if not isinstance(saved, dict) or not saved:
+                    # Older records did not save a launch profile. Rebuild it
+                    # only when the current custom ship still matches exactly.
+                    saved_ship = str(resume_row["ship"])
+                    saved = {
+                        "ship": saved_ship if saved_ship in load_ships() else CUSTOM_SHIP_KEY,
+                        "mode": resume_row["mode"],
+                        "limit_type": resume_row["limit_type"],
+                        "limit_value": resume_row["limit_value"],
+                        "quick_battle": bool(resume_row["quick_battle"]),
+                        "ocr_device": "nvidia",
+                        "launcher_client": last_launch_client(),
+                    }
+                    if saved["ship"] == CUSTOM_SHIP_KEY:
+                        current_custom = load_custom_ship()
+                        if current_custom["name"] != saved_ship:
+                            raise ValueError("旧任务的自定义舰船配置已变化，无法安全接续")
+                        saved["custom_ship_name"] = saved_ship
+                        saved["custom_secondary_range"] = current_custom["secondary_range"]
+                payload = saved
+                if (
+                    str(payload.get("mode")) != str(resume_row["mode"])
+                    or str(payload.get("limit_type")) != str(resume_row["limit_type"])
+                    or float(payload.get("limit_value", -1)) != float(resume_row["limit_value"])
+                    or bool(payload.get("quick_battle", False)) != bool(resume_row["quick_battle"])
+                ):
+                    raise ValueError("历史任务配置不一致，无法接续")
+            elif pending_run is not None:
+                raise ValueError("上一组任务尚未终止，请点击继续；若要重开，请先点击终止任务")
+            ship = str(payload.get("ship", "pommern")).strip().lower()
+            mode = str(payload.get("mode", "asymmetric"))
+            limit_type = str(payload.get("limit_type", "continuous"))
+            try:
+                limit_value = float(payload.get("limit_value", 0) or 0)
+            except (TypeError, ValueError) as error:
+                raise ValueError("运行限制必须是数字") from error
+            quick_battle = bool(payload.get("quick_battle", False))
+            ocr_device = str(payload.get("ocr_device", "nvidia"))
+            if ocr_device not in {"cpu", "nvidia"}:
+                raise ValueError("OCR 设备必须是 cpu 或 nvidia")
+            launcher_client = normalize_launch_client(
+                payload.get("launcher_client", last_launch_client())
+            )
+            close_game_when_done = bool(
+                payload.get("close_game_when_done", False)
+            )
+            ships = load_ships()
+            custom_ship_name = ""
+            custom_secondary_range = 0.0
+            if ship == CUSTOM_SHIP_KEY:
+                custom_ship_name, custom_secondary_range = resolve_custom_ship_for_run(
+                    payload
+                )
+            elif ship not in ships:
+                raise ValueError("未知舰船配置")
+            if mode not in MODES:
+                raise ValueError("未知战斗模式")
+            if limit_type not in {"rounds", "duration", "continuous"}:
+                raise ValueError("限制类型必须是轮次、时间或持续运行")
+            if limit_type == "continuous":
+                limit_value = 0
+            elif not 1 <= limit_value <= (100 if limit_type == "rounds" else 1440):
+                raise ValueError("运行限制超出允许范围")
+            if resume_row and (
+                (limit_type == "rounds" and int(resume_row["completed_rounds"]) >= int(limit_value))
+                or (limit_type == "duration" and float(resume_row["duration_seconds"]) >= limit_value * 60)
+            ):
+                raise ValueError("原任务目标已经达到，无需接续")
+            if running_game_requires_elevation():
+                raise ElevationRequiredError(
+                    "检测到游戏以管理员权限运行，普通权限控制会被 Windows 拦截"
+                )
+            if ship == CUSTOM_SHIP_KEY:
+                # Persist the selection only after every launch validation has
+                # passed; a rejected start must not replace the last ship that
+                # the player actually configured.
+                save_custom_ship(custom_ship_name, custom_secondary_range)
+
+            run_id = resume_run_id or uuid.uuid4().hex[:12]
+            resume_config = {
+                "ship": ship,
+                "mode": mode,
+                "limit_type": limit_type,
+                "limit_value": limit_value,
+                "quick_battle": quick_battle,
+                "ocr_device": ocr_device,
+                "launcher_client": launcher_client,
+                "close_game_when_done": close_game_when_done,
+                "shutdown_when_done": bool(payload.get("shutdown_when_done", False)),
+            }
+            if ship == CUSTOM_SHIP_KEY:
+                resume_config.update({
+                    "custom_ship_name": custom_ship_name,
+                    "custom_secondary_range": custom_secondary_range,
+                })
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            for path in (STATE_PATH, STOP_PATH, PAUSE_PATH, RESUME_PATH):
+                if path.exists():
+                    path.unlink()
+            env = os.environ.copy()
+            env.update(
+                {
+                    "WOWS_SHIP": ship,
+                    "WOWS_OCR_DEVICE": ocr_device,
+                    "WOWS_MODE": mode,
+                    "WOWS_RUN_ID": run_id,
+                    "WOWS_STATE_FILE": str(STATE_PATH),
+                    "WOWS_STOP_FILE": str(STOP_PATH),
+                    "WOWS_PAUSE_FILE": str(PAUSE_PATH),
+                    "WOWS_RESUME_FILE": str(RESUME_PATH),
+                    "WOWS_MAX_ROUNDS": str(int(limit_value)) if limit_type == "rounds" else "0",
+                    "WOWS_DURATION_MINUTES": str(limit_value) if limit_type == "duration" else "0",
+                    "WOWS_QUICK_BATTLE": "1" if quick_battle else "0",
+                    "WOWS_INITIAL_COMPLETED_ROUNDS": str(int(resume_row["completed_rounds"])) if resume_row else "0",
+                    "WOWS_INITIAL_ELAPSED_SECONDS": str(float(resume_row["duration_seconds"])) if resume_row else "0",
+                    "WOWS_RESUME_EXISTING": "1" if resume_row else "0",
+                    "WOWS_LAUNCHER_CLIENT": launcher_client,
+                    "WOWS_CLOSE_GAME_WHEN_DONE": (
+                        "1" if close_game_when_done else "0"
+                    ),
+                    "WOWS_SHUTDOWN_WHEN_DONE": "1" if payload.get("shutdown_when_done", False) else "0",
+                    "PYTHONUNBUFFERED": "1",
+                    "PYTHONUTF8": "1",
+                }
+            )
+            if ship == CUSTOM_SHIP_KEY:
+                env["WOWS_CUSTOM_SHIP_NAME"] = custom_ship_name
+                env["WOWS_CUSTOM_SECONDARY_RANGE"] = str(custom_secondary_range)
+            else:
+                env.pop("WOWS_CUSTOM_SHIP_NAME", None)
+                env.pop("WOWS_CUSTOM_SECONDARY_RANGE", None)
+            self.log_stream = LOG_PATH.open("w", encoding="utf-8")
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            creation_flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            try:
+                self.process = subprocess.Popen(
+                    [sys.executable, str(BASE_DIR / "tools" / "run_with_ocr.py")],
+                    cwd=BASE_DIR,
+                    env=env,
+                    stdout=self.log_stream,
+                    stderr=subprocess.STDOUT,
+                    creationflags=creation_flags,
+                )
+            except OSError:
+                self.log_stream.close()
+                self.log_stream = None
+                raise
+            self.run_id = run_id
+            remember_launch_client(launcher_client)
+            if resume_row:
+                self.store.reopen_run(run_id, resume_config)
+            else:
+                self.store.create_run(
+                    run_id,
+                    custom_ship_name if ship == CUSTOM_SHIP_KEY else ship,
+                    mode,
+                    limit_type,
+                    limit_value,
+                    quick_battle=quick_battle,
+                    resume_config=resume_config,
+                )
+            return {"run_id": run_id, "resumed": bool(resume_row)}
+
+    def resume_finished(self, run_id):
+        return self.start({"resume_run_id": run_id})
+
+    def stop(self):
+        with self.lock:
+            self._reconcile()
+            if self.process is None:
+                candidate = self.store.get_resume_candidate()
+                if candidate is None:
+                    return False
+                self.store.abandon_run(candidate["id"])
+                return True
+            STOP_PATH.write_text("stop", encoding="utf-8")
+            if self.run_id:
+                self.store.abandon_run(self.run_id)
+            threading.Thread(
+                target=self._watch_stop_request,
+                args=(self.process,),
+                daemon=True,
+            ).start()
+            return True
+
+    def resume(self):
+        """Release either a Web pause or a keyboard-intervention hold."""
+        with self.lock:
+            self._reconcile()
+            if self.process is None or STOP_PATH.exists():
+                return False
+            PAUSE_PATH.unlink(missing_ok=True)
+            RESUME_PATH.write_text("resume", encoding="utf-8")
+            return True
+
+    def pause(self):
+        """Cooperatively freeze new system commands without stopping the ship."""
+        with self.lock:
+            self._reconcile()
+            if self.process is None or STOP_PATH.exists():
+                return False
+            RESUME_PATH.unlink(missing_ok=True)
+            PAUSE_PATH.write_text("pause", encoding="utf-8")
+            return True
+
+    def status(self):
+        with self.lock:
+            self._reconcile()
+            running = self.process is not None
+            process_id = self.process.pid if self.process else None
+            run_id = self.run_id
+            resume_candidate = None if running else self.store.get_resume_candidate()
+        state = self._read_runtime_state()
+        if not state:
+            state = {"state": "idle", "message": "等待启动"}
+        defaults = {
+            "completed_rounds": 0,
+            "current_round": 0,
+            "elapsed_seconds": 0.0,
+            "route_phase": "unplanned",
+            "route_progress": 0.0,
+            "route_waypoint": 0,
+            "route_arrived": False,
+            "minimap_player": None,
+            "navigation_target": None,
+            "capture_zone_center": None,
+            "capture_zone_radius": None,
+            "capture_zone_label": "",
+            "nearest_enemy": None,
+            "minimap_enemy_count": 0,
+            "minimap_contacts": [],
+            "capture_zones": [],
+            "minimap_islands": [],
+            "other_consumables_ready": False,
+            "navigation_source": "unknown",
+            "stop_after_current": False,
+            "manual_intervention_latched": False,
+            "manual_intervention_active": False,
+            "manual_intervention_seconds": 0.0,
+            "manual_intervention_remaining_seconds": 0.0,
+            "minimap_snapshot": "",
+            "last_outcome": "unknown",
+        }
+        for key, value in defaults.items():
+            state.setdefault(key, value)
+        state_run_id = str(state.get("run_id") or run_id or "")
+        if state_run_id and bool(state.get("quick_battle", False)):
+            # Also repairs the most recent quick run created before the
+            # database gained its explicit quick_battle column.
+            self.store.update_run_quick_battle(state_run_id, True)
+        paused_by_user = bool(running and PAUSE_PATH.exists())
+        state["terminating"] = bool(running and STOP_PATH.exists())
+        state["paused_by_user"] = paused_by_user
+        if paused_by_user:
+            state["manual_intervention_latched"] = True
+            state["movement_mode"] = "manual_pause"
+            state["movement_reason"] = "网页手动暂停；保持当前船速和舵位，不再下发新指令"
+        # Replay the complete per-run ledger: polling can skip an entire
+        # settlement while the browser is closed or background-throttled.
+        for reward_state in [*state.get("reward_history", []), state]:
+            if reward_state.get("rewards_status") not in {"recognized", "unrecognized"}:
+                continue
+            rewards = reward_state.get("last_rewards") or {}
+            reward_round = int(reward_state.get("rewards_round") or 0)
+            reward_run_id = str(reward_state.get("run_id") or run_id or "")
+            if isinstance(rewards, dict) and reward_run_id and reward_round > 0:
+                recognized = reward_state.get("rewards_status") == "recognized"
+                if recognized:
+                    self.store.upsert_auto_rewards(
+                        reward_run_id,
+                        reward_round,
+                        rewards,
+                    )
+                self.store.upsert_battle_result(
+                    reward_run_id,
+                    reward_round,
+                    reward_state.get("last_outcome", "unknown"),
+                    rewards,
+                    rewards_recognized=recognized,
+                )
+        elapsed_seconds = float(state.get("elapsed_seconds") or 0.0)
+        if running and state.get("started_at"):
+            elapsed_seconds = max(
+                elapsed_seconds,
+                time.time() - float(state["started_at"]),
+            )
+            state["elapsed_seconds"] = elapsed_seconds
+        if run_id and running:
+            self.store.update_run_progress(
+                run_id,
+                state.get("completed_rounds", 0),
+                elapsed_seconds,
+            )
+        if not running and state.get("state") in {
+            "starting",
+            "launching_game",
+            "entering_game",
+            "preparing",
+            "battle",
+            "recovering",
+            "requeueing",
+            "returning",
+            "collecting_rewards",
+        }:
+            state.update(
+                {
+                    "state": "stopped",
+                    "message": "运行进程已结束，未保留活动控制",
+                    "safety_state": "idle",
+                    "movement_verified": False,
+                    "target_distance_km": None,
+                    "distance_source": "unknown",
+                    "minimap_distance_km": None,
+                    "distance_confidence": 0.0,
+                    "target_track_id": "",
+                    "ocr_status": "no_target",
+                    "ocr_provider": "uninitialized",
+                    "movement_mode": "idle",
+                    "movement_reason": "",
+                    "capture_point_distance_km": None,
+                    "inside_capture_point": False,
+                    "route_phase": "unplanned",
+                    "route_progress": 0.0,
+                    "route_waypoint": 0,
+                    "route_arrived": False,
+                    "minimap_player": None,
+                    "navigation_target": None,
+                    "capture_zone_center": None,
+                    "capture_zone_radius": None,
+                    "capture_zone_label": "",
+                    "nearest_enemy": None,
+                    "minimap_enemy_count": 0,
+                    "navigation_source": "unknown",
+                    "stop_after_current": False,
+                }
+            )
+        if not running and state.get("state") in {"completed", "stopped"}:
+            state.update(
+                {
+                    "error": "",
+                    "movement_mode": "idle",
+                    "movement_reason": "控制已安全释放",
+                    "autopilot_enabled": False,
+                    "autopilot_confirmed": False,
+                    "rudder_indicator": "neutral",
+                    "commanded_rudder": None,
+                    "route_phase": "unplanned",
+                    "route_progress": 0.0,
+                    "route_waypoint": 0,
+                    "route_arrived": False,
+                    "inside_capture_point": False,
+                    "stop_after_current": False,
+                }
+            )
+        if resume_candidate is not None:
+            # A fresh panel process may not have the old worker's state file.
+            # The database is the durable source for the interrupted plan.
+            state["run_id"] = resume_candidate["id"]
+            state["state"] = resume_candidate["status"]
+            state["completed_rounds"] = max(
+                int(state.get("completed_rounds") or 0),
+                int(resume_candidate["completed_rounds"]),
+            )
+            state["current_round"] = state["completed_rounds"] + 1
+            state["elapsed_seconds"] = max(
+                float(state.get("elapsed_seconds") or 0),
+                float(resume_candidate["duration_seconds"]),
+            )
+            state["max_rounds"] = (
+                int(resume_candidate["limit_value"])
+                if resume_candidate["limit_type"] == "rounds" else 0
+            )
+            state["duration_minutes"] = (
+                float(resume_candidate["limit_value"])
+                if resume_candidate["limit_type"] == "duration" else 0
+            )
+            state["ship_display_name"] = resume_candidate["ship"]
+            state["mode"] = resume_candidate["mode"]
+        state.update(
+            {
+                "running": running,
+                "pid": process_id,
+                "resume_candidate": {
+                    "run_id": resume_candidate["id"],
+                    "completed_rounds": resume_candidate["completed_rounds"],
+                } if resume_candidate else None,
+                # Keep the latest completed task selected across a control
+                # panel restart; a new start replaces it with the new run id.
+                "run_id": run_id or state.get("run_id"),
+            }
+        )
+        state["calibration"] = CalibrationStore().status().to_dict()
+        state["log"] = tail_log()
+        return state
+
+
+def load_ships():
+    with (BASE_DIR / "config" / "ship.yaml").open("r", encoding="utf-8") as stream:
+        raw = yaml.safe_load(stream) or {}
+    return {
+        key: {
+            "name": value.get("display_name", value.get("name", key)),
+            "type": value.get("type", ""),
+            "nation": value.get("nation", ""),
+            "secondary_range": value.get("secondary", {}).get("range", 0),
+            "speed": value.get("navigation", {}).get("speed", 0),
+        }
+        for key, value in raw.items()
+        if key in SUPPORTED_SHIPS
+    }
+
+
+def tail_log(lines=80, *, max_bytes=256 * 1024):
+    """Return the last log lines without re-reading a potentially huge file.
+
+    ``/api/status`` is polled about once per second while the panel is open.
+    Reading and splitting an unbounded runtime.log on every poll made the
+    console slower the longer a task ran, so read a bounded tail instead and
+    grow the window only when the last block does not contain enough lines.
+    """
+    if not LOG_PATH.exists():
+        return []
+    try:
+        with LOG_PATH.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            block = min(size, max_bytes)
+            while True:
+                stream.seek(max(0, size - block))
+                text = stream.read(block).decode("utf-8", "replace")
+                parts = text.splitlines()
+                if len(parts) > lines or block >= size:
+                    break
+                block = min(size, block * 2)
+    except OSError:
+        return []
+    if block < size and len(parts) > lines:
+        # The cut likely landed inside the oldest line; that partial line is
+        # not useful evidence and would otherwise appear as a corrupt entry.
+        parts = parts[1:]
+    return parts[-lines:]
+
+
+def _write_instance_file(host: str, port: int) -> None:
+    """Record the live console so the launcher can reopen this exact port."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temporary = INSTANCE_PATH.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "host": host,
+                    "port": port,
+                    "version": updater.local_version(),
+                    "started_at": time.time(),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(INSTANCE_PATH)
+    except OSError:
+        logger.debug("无法写入控制台实例信息", exc_info=True)
+
+
+def _clear_instance_file() -> None:
+    """Remove the recorder only while it still belongs to this process."""
+    try:
+        payload = json.loads(INSTANCE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    try:
+        owner = int(payload.get("pid") or 0) if isinstance(payload, dict) else 0
+    except (TypeError, ValueError):
+        owner = 0
+    if owner == os.getpid():
+        try:
+            INSTANCE_PATH.unlink()
+        except OSError:
+            pass
+
+
+def screenshot_storage_status():
+    """Report generated screenshot usage inside the project folder."""
+    files = (
+        [
+            path
+            for path in SCREENSHOT_ROOT.rglob("*")
+            if path.is_file() and path.suffix.lower() in SCREENSHOT_SUFFIXES
+        ]
+        if SCREENSHOT_ROOT.exists()
+        else []
+    )
+    return {
+        "count": len(files),
+        "bytes": sum(path.stat().st_size for path in files),
+        "path": str(SCREENSHOT_ROOT.relative_to(BASE_DIR)),
+    }
+
+
+def clear_generated_screenshots():
+    """Delete only image files below the fixed project screenshot root."""
+    if RUNNER.status().get("running"):
+        raise RuntimeError("自动任务运行中，不能清理截图")
+    root = SCREENSHOT_ROOT.resolve()
+    removed = 0
+    reclaimed = 0
+    if not root.exists():
+        return {"removed": 0, "bytes": 0, **screenshot_storage_status()}
+    for path in root.rglob("*"):
+        resolved = path.resolve()
+        if (
+            path.is_file()
+            and resolved.is_relative_to(root)
+            and path.suffix.lower() in SCREENSHOT_SUFFIXES
+        ):
+            reclaimed += path.stat().st_size
+            path.unlink()
+            removed += 1
+    for directory in sorted(
+        (path for path in root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return {
+        "removed": removed,
+        "bytes": reclaimed,
+        **screenshot_storage_status(),
+    }
+
+
+STORE = ControlStore()
+RUNNER = RunnerManager(STORE)
+CALIBRATION = WebCalibrationWorkflow()
+
+
+class ControlHttpServer(ThreadingHTTPServer):
+    """Serve the console on an exclusively bound port.
+
+    ``HTTPServer`` enables ``SO_REUSEADDR``. On Windows that option means
+    "allow binding an address that is already in use", so a second console
+    would silently start on the same port and both processes would write the
+    same runtime state, database and log files. Requiring an exclusive bind
+    makes a duplicate launch fail fast with an actionable message instead.
+    """
+
+    allow_reuse_address = False
+
+
+class ControlHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(STATIC_DIR), **kwargs)
+
+    def log_message(self, format, *args):
+        return
+
+    def end_headers(self):
+        # This is a local live-control surface. Do not keep an older app.js in
+        # browser cache: Start must always change into Pause/Continue at once.
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        super().end_headers()
+
+    def _json(self, payload, status=HTTPStatus.OK):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _payload(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 64_000:
+            raise ValueError("请求体过大")
+        return json.loads(self.rfile.read(length) or b"{}")
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/config":
+            self._json(
+                {
+                    "ships": load_ships(),
+                    "modes": MODES,
+                    "custom_ship": load_custom_ship(),
+                    "custom_ship_presets": load_custom_ship_presets(),
+                    "calibration": CalibrationStore().status().to_dict(),
+                    "game": game_status(),
+                    "launchers": launcher_statuses(),
+                    "last_launcher_client": last_launch_client(),
+                    "control_elevated": current_process_is_elevated(),
+                }
+            )
+            return
+        if path == "/api/calibration":
+            self._json(CalibrationStore().status().to_dict())
+            return
+        if path == "/api/calibration/session":
+            self._json(CALIBRATION.status())
+            return
+        if path == "/api/game/status":
+            self._json(game_status())
+            return
+        if path == "/api/status":
+            self._json(RUNNER.status())
+            return
+        if path == "/api/dashboard":
+            self._json(STORE.dashboard())
+            return
+        if path == "/api/update":
+            query = parse_qs(urlparse(self.path).query)
+            refresh = str((query.get("refresh") or ["0"])[0]).lower() in {
+                "1", "true", "yes", "on",
+            }
+            try:
+                self._json(updater.check_for_updates(force=refresh))
+            except Exception as error:
+                logger.warning("更新检查失败: %s", error)
+                self._json({"error": str(error)})
+            return
+        if path == "/api/screenshots":
+            self._json(screenshot_storage_status())
+            return
+        super().do_GET()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        try:
+            payload = self._payload()
+            if path == "/api/run/start":
+                self._json({"ok": True, **RUNNER.start(payload)}, HTTPStatus.CREATED)
+                return
+            if path == "/api/control/elevate":
+                if RUNNER.status().get("running"):
+                    raise RuntimeError("自动任务运行中，不能重启控制台权限")
+                launched = request_elevated_control_server()
+                self._json(
+                    {
+                        "ok": True,
+                        "restarting": launched,
+                        "control_elevated": current_process_is_elevated(),
+                    },
+                    HTTPStatus.ACCEPTED,
+                )
+                if launched:
+                    threading.Timer(0.45, self.server.shutdown).start()
+                return
+            if path == "/api/custom-ship":
+                name, secondary_range = validate_custom_ship(
+                    payload,
+                    allow_empty_name=True,
+                )
+                save_custom_ship(name, secondary_range)
+                self._json({"ok": True})
+                return
+            if path == "/api/custom-ship-presets":
+                name, secondary_range = validate_custom_ship(payload)
+                preset, presets = save_custom_ship_preset(
+                    name,
+                    secondary_range,
+                    payload.get("preset_id", ""),
+                )
+                self._json(
+                    {"ok": True, "preset": preset, "presets": presets},
+                    HTTPStatus.CREATED,
+                )
+                return
+            if path == "/api/custom-ship-presets/delete":
+                presets = delete_custom_ship_preset(payload.get("preset_id", ""))
+                self._json({"ok": True, "presets": presets})
+                return
+            if path == "/api/run/stop":
+                self._json({"ok": RUNNER.stop()})
+                return
+            if path == "/api/run/pause":
+                self._json({"ok": RUNNER.pause()})
+                return
+            if path == "/api/run/resume":
+                self._json({"ok": RUNNER.resume()})
+                return
+            if path == "/api/run/resume-finished":
+                self._json({"ok": True, **RUNNER.resume_finished(payload.get("run_id"))}, HTTPStatus.CREATED)
+                return
+            if path == "/api/game/launch":
+                self._json({"ok": True, **CALIBRATION.launch()})
+                return
+            if path == "/api/calibration/prepare":
+                if RUNNER.status().get("running"):
+                    raise RuntimeError("自动任务运行中，不能开始校准")
+                self._json(
+                    {"ok": True, **CALIBRATION.prepare(payload.get("ship", "pommern"))},
+                    HTTPStatus.ACCEPTED,
+                )
+                return
+            if path == "/api/calibration/action":
+                self._json({"ok": True, **CALIBRATION.run_action()})
+                return
+            if path == "/api/calibration/confirm":
+                confirmed = payload.get("confirmed")
+                if not isinstance(confirmed, bool):
+                    raise ValueError("confirmed 必须是布尔值")
+                self._json({"ok": True, **CALIBRATION.confirm(confirmed)})
+                return
+            if path == "/api/calibration/cancel":
+                self._json({"ok": True, **CALIBRATION.cancel()})
+                return
+            if path == "/api/resources":
+                run_id = str(payload.get("run_id") or RUNNER.run_id or "")
+                if not run_id:
+                    raise ValueError("没有可关联的运行任务")
+                entry_id = STORE.add_resources(
+                    run_id,
+                    payload.get("round_no", 0),
+                    payload,
+                    str(payload.get("note", "")),
+                )
+                self._json({"ok": True, "entry_id": entry_id}, HTTPStatus.CREATED)
+                return
+            if path == "/api/screenshots/clear":
+                self._json({"ok": True, **clear_generated_screenshots()})
+                return
+            self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+        except ElevationRequiredError as error:
+            self._json(
+                {"error": str(error), "code": "elevation_required"},
+                HTTPStatus.CONFLICT,
+            )
+        except (ValueError, TypeError, RuntimeError, json.JSONDecodeError) as error:
+            self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+
+
+def main():
+    if not ensure_elevated_control_server():
+        return 0
+    host = os.environ.get("WOWS_PANEL_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    # 8765 falls inside a Windows-reserved port block (Hyper-V/WSL dynamic
+    # range 8753-8852) on some machines, which makes bind fail with
+    # WinError 10013.  8899 is outside every observed reservation.
+    try:
+        port = int(str(os.environ.get("WOWS_PANEL_PORT", "8899")).strip())
+    except ValueError:
+        port = 0
+    if not 1 <= port <= 65535:
+        print(
+            "控制台启动失败：WOWS_PANEL_PORT 必须是 1 到 65535 之间的整数",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
+    wait_for_port = "--wait-for-port" in sys.argv
+    # A just-stopped console releases its socket in well under a second. Keep
+    # the retry short so an elevation restart still succeeds while a genuine
+    # port conflict is reported quickly instead of after a long silence.
+    deadline = time.monotonic() + (5.0 if wait_for_port else 0.0)
+    while True:
+        try:
+            server = ControlHttpServer((host, port), ControlHandler)
+            break
+        except OSError as error:
+            if not wait_for_port or time.monotonic() >= deadline:
+                # The launcher shows this line next to the exit code, so keep
+                # the actionable hint instead of a multi-line traceback.
+                print(
+                    f"控制台启动失败：无法监听 {host}:{port}（{error}）。"
+                    "若端口已被占用，请关闭占用该端口的程序，或设置 "
+                    "WOWS_PANEL_PORT 使用其他端口后重试。",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return 2
+            time.sleep(0.2)
+    url = f"http://{host}:{port}"
+    _write_instance_file(host, port)
+    print(f"战舰控制台已启动: {url}", flush=True)
+    updater.start_auto()
+    if (
+        os.environ.get("WOWS_PANEL_NO_BROWSER") != "1"
+        and "--no-browser" not in sys.argv
+    ):
+        threading.Timer(0.7, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        updater.stop_auto()
+        server.server_close()
+        _clear_instance_file()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
