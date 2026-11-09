@@ -72,6 +72,82 @@ def test_port_recovery_requires_both_numeric_anchors(monkeypatch, clock, health)
     assert not vision.has_numeric_battle_hud(image, object())
 
 
+def port_conflict_bot(*, control_initialized=False, hud=True):
+    """A frame whose colour/texture evidence is ambiguous between port and battle."""
+    return SimpleNamespace(
+        vision=SimpleNamespace(
+            classify_screen=lambda _: ScreenState.BATTLE,
+            _has_battle_hud=lambda _: hud,
+            _has_battle_hud_layout=lambda _: True,
+            read_battle_clock_seconds=lambda *_: None,
+            read_health_fraction=lambda *_: None,
+        ),
+        distance_reader=SimpleNamespace(backend=SimpleNamespace(recognize=lambda _: [])),
+        _round_control_initialized=control_initialized,
+    )
+
+
+def test_confirmed_port_action_overrides_a_battle_guess(monkeypatch):
+    """A dark port satisfies the HUD anchors and used to deadlock as BATTLE.
+
+    The rendered 加入战斗 label is the one piece of evidence a live match never
+    shows, so the runtime router must reject the battle guess before any
+    driving, M-map or ship-selection decision is made.
+    """
+    monkeypatch.setattr(main, "port_battle_action_point", lambda image, backend: (1281, 38))
+    bot = port_conflict_bot()
+    frame = np.zeros((90, 160, 3), np.uint8)
+    assert main.classify_runtime_screen(bot, frame) == ScreenState.PORT
+    assert main.classify_battle_continuity_screen(bot, frame) == ScreenState.PORT
+
+
+def test_absent_port_action_keeps_the_battle_guess(monkeypatch):
+    monkeypatch.setattr(main, "port_battle_action_point", lambda image, backend: None)
+    bot = port_conflict_bot()
+    frame = np.zeros((90, 160, 3), np.uint8)
+    assert main.classify_runtime_screen(bot, frame) == ScreenState.BATTLE
+
+
+def test_established_control_skips_the_port_ocr(monkeypatch):
+    """Once the round is running the port OCR must not run on every frame."""
+    calls = []
+
+    def action_point(image, backend):
+        calls.append(image)
+        return (1281, 38)
+
+    monkeypatch.setattr(main, "port_battle_action_point", action_point)
+    bot = port_conflict_bot(control_initialized=True)
+    frame = np.zeros((90, 160, 3), np.uint8)
+    assert main.classify_runtime_screen(bot, frame) == ScreenState.BATTLE
+    assert calls == []
+
+
+def test_port_ocr_verdict_is_cached_per_frame(monkeypatch):
+    calls = []
+
+    def action_point(image, backend):
+        calls.append(image)
+        return (1281, 38)
+
+    monkeypatch.setattr(main, "port_battle_action_point", action_point)
+    bot = port_conflict_bot()
+    frame = np.zeros((90, 160, 3), np.uint8)
+    main.classify_runtime_screen(bot, frame)
+    main.classify_battle_continuity_screen(bot, frame)
+    assert len(calls) == 1
+
+
+def test_port_ocr_failure_stays_fail_closed(monkeypatch):
+    def broken(image, backend):
+        raise RuntimeError("OCR unavailable")
+
+    monkeypatch.setattr(main, "port_battle_action_point", broken)
+    bot = port_conflict_bot()
+    frame = np.zeros((90, 160, 3), np.uint8)
+    assert main.classify_runtime_screen(bot, frame) == ScreenState.BATTLE
+
+
 def unconfirmed_battle_bot():
     return SimpleNamespace(
         hwnd=1,
@@ -88,7 +164,6 @@ def unconfirmed_battle_bot():
         _battle_phase_unconfirmed_since=None,
         _battle_phase_escape_attempts=0,
     )
-
 
 @pytest.fixture
 def unconfirmed_battle_environment(monkeypatch):
@@ -126,6 +201,26 @@ def test_unconfirmed_battle_without_verified_hint_never_escapes(
     assert main.run_battle(bot) == "resume_state"
     bot.gamepad.escape.assert_not_called()
     assert bot._battle_phase_escape_attempts == 0
+
+
+def test_unconfirmed_battle_on_a_port_page_never_sends_escape(
+    monkeypatch, unconfirmed_battle_environment,
+):
+    """The port has no match clock, so the timeout must not press Esc there.
+
+    This is the exact live loop that looked like "the bot does nothing": every
+    cycle re-entered the battle branch, timed out on 正式开战未确认, and either
+    pressed Esc into the port menu or returned without any action.
+    """
+    bot = unconfirmed_battle_bot()
+    bot._battle_phase_unconfirmed_since = time.monotonic() - 30
+    monkeypatch.setattr(main, "observe_battle_phase", lambda *args: BattlePhase.UNKNOWN)
+    monkeypatch.setattr(main, "recovery_escape_hint", lambda *args: (100, 20))
+    monkeypatch.setattr(main, "port_battle_action_point", lambda image, backend: (1281, 38))
+
+    assert main.run_battle(bot) == "resume_state"
+    bot.gamepad.escape.assert_not_called()
+    assert bot._battle_phase_unconfirmed_since is None
 
 
 def test_legitimate_preparation_countdown_never_escapes(

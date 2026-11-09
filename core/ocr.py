@@ -11,6 +11,8 @@ import math
 import os
 from pathlib import Path
 import re
+import site
+import sysconfig
 import time
 from typing import Protocol
 import unicodedata
@@ -143,33 +145,103 @@ class RapidOcrBackend:
         }
 
     @staticmethod
-    def _cuda_dll_directories() -> list[Path]:
+    def _nvidia_package_roots() -> list[Path]:
+        """Locate every ``nvidia`` directory that the environment can import.
+
+        Wheels are installed into the interpreter's ``site-packages``, but the
+        control console may run from a different working directory, so the
+        direct ``sysconfig`` lookup is combined with an import-spec discovery.
+        """
+        roots: list[Path] = []
+        candidate_bases = []
+        try:
+            candidate_bases.extend(site.getsitepackages())
+        except Exception:
+            pass
+        try:
+            candidate_bases.append(site.getusersitepackages())
+        except Exception:
+            pass
+        try:
+            candidate_bases.append(sysconfig.get_paths().get("purelib", ""))
+        except Exception:
+            pass
+        for base in candidate_bases:
+            if base:
+                roots.append(Path(base) / "nvidia")
+        try:
+            spec = importlib.util.find_spec("nvidia")
+        except (ImportError, ModuleNotFoundError, ValueError):
+            spec = None
+        if spec is not None:
+            for location in list(spec.submodule_search_locations or ()):
+                roots.append(Path(location))
+            if spec.origin:
+                roots.append(Path(spec.origin).parent)
+        unique: list[Path] = []
+        for root in roots:
+            if root.is_dir() and root not in unique:
+                unique.append(root)
+        return unique
+
+    @staticmethod
+    def _nvidia_dll_directories(root: Path) -> list[Path]:
+        """Return the DLL folders of one ``nvidia`` package directory.
+
+        Pip wheel layouts differ between CUDA majors, so every known shape is
+        probed instead of assuming a single convention:
+
+        * ``nvidia/<library>/bin``            (cuDNN, and the CUDA 12 wheels)
+        * ``nvidia/cu13/bin/x86_64``          (the CUDA 13 wheels)
+        * ``nvidia/<library>/bin/<arch>``     (defensive, future layouts)
+        """
+        if not root.is_dir():
+            return []
+        directories: list[Path] = []
+
+        def add(path: Path):
+            if path.is_dir() and path not in directories:
+                directories.append(path)
+
+        for path in sorted(root.glob("*/bin")):
+            add(path)
+        for path in sorted(root.glob("*/bin/*")):
+            add(path)
+        for path in sorted(root.glob("cu*/bin/*")):
+            add(path)
+        return directories
+
+    @classmethod
+    def _cuda_dll_directories(cls) -> list[Path]:
+        """Return every directory that may hold a CUDA/cuDNN runtime DLL.
+
+        ONNX Runtime only knows the legacy ``nvidia/<library>/bin`` layout.
+        A CUDA 13 build therefore cannot find ``cublasLt64_13.dll`` and
+        ``cudart64_13.dll`` (installed under ``nvidia/cu13/bin/x86_64``)
+        unless those directories are registered before the provider loads.
+        """
         if os.name != "nt":
             return []
-        candidates = []
+        candidates: list[Path] = []
+
+        def add(path: Path):
+            if path.is_dir() and path not in candidates:
+                candidates.append(path)
+
         configured = os.environ.get("CUDA_PATH", "").strip()
         if configured:
             root = Path(configured)
-            candidates.extend((root / "bin" / "x64", root / "bin"))
+            add(root / "bin" / "x64")
+            add(root / "bin")
         toolkit_root = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
         if toolkit_root.exists():
-            versions = sorted(toolkit_root.glob("v*"), reverse=True)
-            for root in versions:
-                candidates.extend((root / "bin" / "x64", root / "bin"))
-        try:
-            cudnn_spec = importlib.util.find_spec("nvidia.cudnn")
-        except ModuleNotFoundError:
-            cudnn_spec = None
-        if cudnn_spec is not None and cudnn_spec.submodule_search_locations:
-            candidates.extend(
-                Path(location) / "bin"
-                for location in cudnn_spec.submodule_search_locations
-            )
-        unique = []
-        for candidate in candidates:
-            if candidate.is_dir() and candidate not in unique:
-                unique.append(candidate)
-        return unique
+            for root in sorted(toolkit_root.glob("v*"), reverse=True):
+                add(root / "bin" / "x64")
+                add(root / "bin")
+        for root in cls._nvidia_package_roots():
+            for directory in cls._nvidia_dll_directories(root):
+                add(directory)
+        return candidates
 
     def _prepare_cuda_runtime(self, ort):
         directories = self._cuda_dll_directories()
@@ -183,22 +255,32 @@ class RapidOcrBackend:
                     logger.debug("无法注册 CUDA DLL 目录 %s: %s", directory, error)
         if not hasattr(ort, "preload_dlls"):
             return
-        cuda_directories = [
-            directory
-            for directory in directories
-            if "nvidia gpu computing toolkit" in str(directory).lower()
-        ]
+        # A system CUDA toolkit takes precedence: its runtime is the one the
+        # installed driver was validated against.
         cuda_loaded = False
-        for directory in cuda_directories:
+        for directory in directories:
+            if "nvidia gpu computing toolkit" not in str(directory).lower():
+                continue
             try:
                 ort.preload_dlls(cuda=True, cudnn=False, directory=str(directory))
                 cuda_loaded = True
                 break
             except Exception as error:
                 logger.debug("从 %s 预加载 CUDA 失败: %s", directory, error)
-        # cuDNN is installed inside this project virtual environment. On a
-        # machine without a system CUDA toolkit, load all NVIDIA wheels.
-        ort.preload_dlls(cuda=not cuda_loaded, cudnn=True, directory="")
+        # Without a system toolkit the DLLs come from this virtual environment.
+        # ``add_dll_directory`` above already covers both pip layouts; the
+        # explicit preload only warms the libraries up.
+        try:
+            ort.preload_dlls(cuda=not cuda_loaded, cudnn=True, directory="")
+        except Exception as error:
+            logger.debug("ONNX Runtime 默认 CUDA 预加载失败: %s", error)
+        if not cuda_loaded:
+            for directory in directories:
+                try:
+                    ort.preload_dlls(cuda=True, cudnn=True, directory=str(directory))
+                    break
+                except Exception as error:
+                    logger.debug("从 %s 预加载 NVIDIA DLL 失败: %s", directory, error)
 
     def _build_engine(self, RapidOCR, model_root: Path, *, use_cuda: bool):
         engine = RapidOCR(params=self._params(model_root, use_cuda=use_cuda))
@@ -272,6 +354,18 @@ class RapidOcrBackend:
         model_root = Path(rapidocr.__file__).resolve().parent / "models"
         self._engine = self._build_engine(RapidOCR, model_root, use_cuda=False)
 
+    @staticmethod
+    def _is_memory_shortage(error: Exception) -> bool:
+        """True for a host allocation failure rather than a CUDA fault.
+
+        ``Unable to allocate N MiB ... float64`` is a NumPy ``MemoryError``
+        raised while the game, screenshots and OCR buffers compete for system
+        RAM (for example during a map load). It says nothing about the GPU:
+        downgrading the whole process to CPU for the rest of a session turned a
+        one-frame hiccup into a permanent three-fold slowdown.
+        """
+        return isinstance(error, MemoryError) or "Unable to allocate" in str(error)
+
     def recognize_glyph(self, image: np.ndarray) -> list[OcrToken]:
         """Recognize an already located cap letter with the same OCR model.
 
@@ -289,6 +383,9 @@ class RapidOcrBackend:
         except Exception as error:
             if self.execution_provider != "CUDAExecutionProvider":
                 raise
+            if self._is_memory_shortage(error):
+                logger.warning("OCR 内存不足，本帧跳过字形识别（保持 GPU 后端）")
+                return []
             self._fallback_to_cpu(error)
             result = self._engine.text_rec(args)
         return [OcrToken(str(text), float(score)) for text, score in zip(result.txts, result.scores)]
@@ -303,6 +400,12 @@ class RapidOcrBackend:
         except Exception as error:
             if self.execution_provider != "CUDAExecutionProvider":
                 raise
+            if self._is_memory_shortage(error):
+                # Keep the CUDA provider: this was a host allocation spike, not
+                # a provider fault. One lost frame is cheaper than downgrading
+                # every later read (including the match clock) to CPU.
+                logger.warning("OCR 内存不足，本帧跳过识别（保持 GPU 后端）: %s", error)
+                return []
             self._fallback_to_cpu(error)
             result = self._engine(image, use_cls=False, text_score=0.60)
         raw_texts = getattr(result, "txts", None)

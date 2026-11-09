@@ -6,4 +6,8 @@ vgamepad>=0.1.0
 pyyaml>=6.0
 pywin32>=306
 rapidocr==3.8.1
-onnxruntime==1.29.0
+# CPU build. The optional CUDA build in requirements-gpu.txt provides the very
+# same `onnxruntime` module and must replace this distribution, never coexist
+# with it: both wheels write into site-packages/onnxruntime, so keeping the CPU
+# wheel installed leaves a mixed-version package that fails to import.
+onnxruntime>=1.21.0,<2

@@ -1,6 +1,6 @@
 import math
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -588,6 +588,54 @@ def test_missing_pose_does_not_deadlock_confirmed_battle_or_consume_map_attempt(
     assert not getattr(bot, "_opening_autopilot_attempted", False)
     assert not getattr(bot, "_tactical_map_attempted_this_battle", False)
     configure.assert_not_called()
+
+
+def test_full_speed_is_sent_before_the_minimap_pose_is_available():
+    """The first W must not wait for the minimap arrow.
+
+    Waiting for the pose before touching the throttle left the ship at STOP for
+    the first 15-20 s of every match. Throttle does not depend on the pose; only
+    the M-map waypoint does.
+    """
+    frame = np.full((90, 160, 3), 80, dtype=np.uint8)
+
+    class MissingPoseVision:
+        frames = 0
+
+        def grab(self, _hwnd, *, allow_stale=False):
+            self.frames += 1
+            return frame
+
+        def classify_screen(self, _image):
+            return ScreenState.LOADING if self.frames == 1 else ScreenState.BATTLE
+
+        def find_minimap(self, _image):
+            return frame
+
+        def find_player_pose_on_minimap(self, _minimap):
+            return None
+
+        def read_battle_clock_seconds(self, _image, _backend):
+            return 1150
+
+    throttle = Mock()
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=MissingPoseVision(),
+        gamepad=SimpleNamespace(full_speed=throttle, reassert_full_speed=throttle),
+        intervention=None,
+    )
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch("main.configure_opening_autopilot") as configure,
+        patch("main.observe_battle_phase", return_value=main.BattlePhase.ACTIVE),
+    ):
+        assert wait_for_battle(bot, timeout=2, require_new_round=True)
+    assert throttle.call_count == 1, "throttle must be ordered once, before the pose"
+    # The M-map attempt is still preserved for the battle controller.
+    configure.assert_not_called()
+    assert not getattr(bot, "_tactical_map_attempted_this_battle", False)
 
 
 def test_loading_start_action_blocks_full_speed_and_map_until_it_disappears():

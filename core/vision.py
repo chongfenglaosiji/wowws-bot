@@ -102,6 +102,10 @@ class Vision:
         self.last_frame_quality = None
         self._minimap_grid_cache = None
         self._minimap_grid_checked_at = float("-inf")
+        # Set by BattleBot to the shared OCR backend. Only then can the port
+        # action label be read; without it every decision stays purely visual.
+        self.text_backend = None
+        self._port_action_cache = None
         self.red_lo1 = np.array([0, 40, 80])
         self.red_hi1 = np.array([15, 255, 255])
         self.red_lo2 = np.array([160, 40, 80])
@@ -2405,6 +2409,32 @@ class Vision:
             ),
         }
 
+    def port_action_visible(self, image):
+        """OCR-confirm the port's rendered ``加入战斗`` action, cached per frame.
+
+        Every other port anchor measures brightness or texture, so a dark or
+        night harbour fails all of them (and can additionally trip the loading
+        artwork fallback). The action label is exposure independent and never
+        appears in a live match, a loading screen or the result page, which
+        makes it the only evidence that resolves those conflicts safely.
+        """
+        backend = self.text_backend
+        if backend is None or image is None or not getattr(image, "size", 0):
+            return False
+        cached = self._port_action_cache
+        if cached is not None and cached[0] is image:
+            return cached[1]
+        try:
+            # Imported lazily: port_navigator depends on this module.
+            from port_navigator import port_battle_action_point
+
+            visible = port_battle_action_point(image, backend) is not None
+        except Exception:
+            logger.debug("港口加入战斗 OCR 复核失败；保留纯视觉判定", exc_info=True)
+            visible = False
+        self._port_action_cache = (image, visible)
+        return visible
+
     def in_port(self, image):
         battle_button = self._crop_region(image, PORT_BATTLE_BUTTON)
         if battle_button.size == 0:
@@ -2441,7 +2471,18 @@ class Vision:
             layout = detect_hud_layout(image)
             if layout.source("health_text") == "anchor" and layout.source("minimap") == "anchor":
                 measured = None
-        return (solid_button_ratio > 0.12 or measured is not None) and anchor_count >= 3
+        if solid_button_ratio <= 0.12 and measured is None:
+            # No rendered action button at all: this cannot be the port, and
+            # the OCR probe is skipped so a live battle frame stays cheap.
+            return False
+        if anchor_count >= 3:
+            return True
+        # The anchors are absolute-brightness tests: a night harbour fails all
+        # of them (measured 0/4) even though the page is unmistakably the port.
+        # A missing anchor set is therefore settled by the action label itself
+        # instead of by threshold tuning, which cannot separate this page from
+        # dark loading artwork.
+        return self.port_action_visible(image)
 
     def in_loading(self, image):
         # Positive port controls outrank broad loading artwork metrics. This

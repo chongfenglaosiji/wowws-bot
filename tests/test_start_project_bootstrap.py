@@ -226,6 +226,28 @@ def test_gpu_install_failure_is_cached_and_force_retries(tmp_path):
     assert output == "gpu_cache_ok"
 
 
+def test_launcher_script_keeps_its_utf8_bom():
+    """Windows PowerShell 5.1 decodes a BOM-less script as the ANSI code page.
+
+    Without the BOM the Chinese messages turn into mojibake and the script
+    stops parsing, so double-clicking start_project.bat fails with syntax
+    errors instead of starting the console.
+    """
+    data = (ROOT / "tools" / "start_project.ps1").read_bytes()
+    assert data.startswith(b"\xef\xbb\xbf"), (
+        "tools/start_project.ps1 must stay UTF-8 with BOM for powershell.exe"
+    )
+    assert not data.decode("utf-8-sig").startswith("??")
+
+
+def test_batch_entry_point_matches_the_console_code_page():
+    """start_project.bat runs `chcp 936`, so it must not be UTF-8 encoded."""
+    data = (ROOT / "start_project.bat").read_bytes()
+    assert not data.startswith(b"\xef\xbb\xbf")
+    text = data.decode("gbk")
+    assert "chcp 936" in text
+
+
 def test_gpu_install_ready_state_skips_reinstall(tmp_path):
     project, python = gpu_project(tmp_path)
     output = run_ps(
@@ -274,6 +296,50 @@ def test_gpu_install_skips_pip_when_cuda_already_available(tmp_path):
         "if ($cache.status -ne 'ready') { throw 'ready state not cached' }; 'gpu_present_ok'"
     )
     assert output == "gpu_present_ok"
+
+
+def test_gpu_inference_failure_with_mismatched_stack_is_replaced(tmp_path):
+    # Regression: a CUDA 13 wheel on a CUDA 12 driver reports "provider
+    # available" and then fails every inference. The launcher must swap the
+    # stack for the pinned one instead of caching "installed but unverified"
+    # until the cache expires.
+    project, python = gpu_project(tmp_path)
+    output = run_ps(
+        f"$script:ProjectRoot = {ps_literal(project)}; "
+        "$script:StartLog = $null; $script:InstallLog = $null; "
+        "function Get-NvidiaGpuInfo { [pscustomobject]@{ Name='RTX Test'; Driver='1.0'; Source='nvidia-smi' } }; "
+        "function Test-CudaProvider { [pscustomobject]@{ Available=$true; Providers='CUDAExecutionProvider'; Detail='' } }; "
+        "function Test-CudaInference { [pscustomobject]@{ Passed=$false; Detail='CUDA failure 801' } }; "
+        "$script:pipCalls = 0; "
+        "function Invoke-PipInstall { $script:pipCalls++; return $true }; "
+        "function Test-GpuStackMatchesRequirements { return $false }; "
+        f"Install-ProjectGpuDependencies {ps_literal(python)}; "
+        "if ($script:pipCalls -ne 1) { throw ('expected one repair install, got ' + $script:pipCalls) }; "
+        f"$cache = Get-Content -LiteralPath {ps_literal(project / 'data' / '.gpu-deps.json')} -Encoding UTF8 -Raw | ConvertFrom-Json; "
+        "if ($cache.status -ne 'ready_unverified') { throw ('unexpected status ' + $cache.status) }; "
+        "'gpu_replaced_ok'"
+    )
+    assert output == "gpu_replaced_ok"
+
+
+def test_gpu_inference_failure_with_matching_stack_never_reinstalls(tmp_path):
+    # Once the pinned stack is installed, a failing inference is a driver
+    # problem. Reinstalling would re-download the wheels on every launch.
+    project, python = gpu_project(tmp_path)
+    output = run_ps(
+        f"$script:ProjectRoot = {ps_literal(project)}; "
+        "$script:StartLog = $null; $script:InstallLog = $null; "
+        "function Get-NvidiaGpuInfo { [pscustomobject]@{ Name='RTX Test'; Driver='1.0'; Source='nvidia-smi' } }; "
+        "function Test-CudaProvider { [pscustomobject]@{ Available=$true; Providers='CUDAExecutionProvider'; Detail='' } }; "
+        "function Test-CudaInference { [pscustomobject]@{ Passed=$false; Detail='CUDA failure 801' } }; "
+        "$script:pipCalls = 0; "
+        "function Invoke-PipInstall { $script:pipCalls++; return $true }; "
+        "function Test-GpuStackMatchesRequirements { return $true }; "
+        f"Install-ProjectGpuDependencies {ps_literal(python)}; "
+        "if ($script:pipCalls -ne 0) { throw ('driver problem triggered a reinstall: ' + $script:pipCalls) }; "
+        "'gpu_driver_only_ok'"
+    )
+    assert output == "gpu_driver_only_ok"
 
 
 def test_install_log_captures_install_output(tmp_path):
