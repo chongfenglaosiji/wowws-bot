@@ -1,3 +1,22 @@
 # Optional NVIDIA acceleration. The one-click launcher installs this when an
 # NVIDIA driver is present; a failed install keeps the CPU runtime available.
-onnxruntime-gpu[cuda,cudnn]==1.29.0
+#
+# Two compatibility rules keep this stack working on real machines:
+#
+# 1. ONNX Runtime must stay on the last build compiled against CUDA 12.
+#    1.27.0 and newer are CUDA 13 builds; CUDA 13 refuses to initialise on a
+#    driver below R580 (cudaGetDeviceCount fails with error 801).
+# 2. The NVIDIA runtime wheels must stay on the CUDA 12.2 era. The newest
+#    CUDA 12 wheels (12.8/12.9, cuDNN 9.2x) call driver APIs such as
+#    cuStreamGetGreenCtx that only exist in 2024+ drivers, so on an older
+#    R525+ driver they load and then fail while building cuDNN graphs.
+#
+# Do not use the unpinned `onnxruntime-gpu` name: pip then resolves the newest
+# release and silently drags in the CUDA 13 wheels again.
+onnxruntime-gpu[cuda,cudnn]==1.26.0
+nvidia-cuda-runtime-cu12==12.2.140
+nvidia-cuda-nvrtc-cu12==12.2.140
+nvidia-cublas-cu12==12.2.5.6
+nvidia-cufft-cu12==11.0.2.54
+nvidia-curand-cu12==10.3.3.141
+nvidia-cudnn-cu12==9.1.0.70

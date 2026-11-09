@@ -38,6 +38,56 @@ def test_clock_jump_or_stale_sample_cannot_confirm_start(previous, current, elap
     assert tracker.observe(ScreenState.BATTLE, current, elapsed) != BattlePhase.ACTIVE
 
 
+def test_slow_retry_cadence_confirms_a_running_match_clock():
+    """The scene-recovery loop samples about once every 13 s.
+
+    The confirmation window used to be a flat 10 s, so a live match could never
+    be confirmed after entering battle and the bot sent no helm command at all.
+    Real values from the reporting machine: 1195 s at the first control pass,
+    1182 s on the next one 13 s later.
+    """
+    tracker = BattlePhaseTracker()
+    assert tracker.observe(ScreenState.BATTLE, 1195, 0) == BattlePhase.UNKNOWN
+    assert tracker.observe(ScreenState.BATTLE, 1182, 13) == BattlePhase.ACTIVE
+    assert tracker.observe(ScreenState.BATTLE, 1169, 26) == BattlePhase.ACTIVE
+
+
+def test_resume_after_a_long_pause_confirms_a_running_clock():
+    tracker = BattlePhaseTracker()
+    tracker.observe(ScreenState.BATTLE, 900, 0)
+    # Paused for 30 s; the match clock kept running the whole time.
+    assert tracker.observe(ScreenState.BATTLE, 870, 30) == BattlePhase.ACTIVE
+
+
+def test_gap_beyond_the_cap_still_requires_fresh_samples():
+    tracker = BattlePhaseTracker()
+    tracker.observe(ScreenState.BATTLE, 900, 0)
+    assert tracker.observe(ScreenState.BATTLE, 810, 90) != BattlePhase.ACTIVE
+
+
+def test_confirmed_active_survives_a_missing_clock_frame():
+    """One unreadable clock frame must not stop an already running ship.
+
+    The tracker used to return UNKNOWN whenever ``read_battle_clock_seconds``
+    missed, even after the match had been confirmed by wall-clock tracking.
+    Every helm command then stopped until two fresh reads arrived (~12 s), which
+    happened repeatedly mid-battle and left the ship coasting.
+    """
+    tracker = BattlePhaseTracker()
+    tracker.observe(ScreenState.BATTLE, 1195, 0)
+    assert tracker.observe(ScreenState.BATTLE, 1182, 13) == BattlePhase.ACTIVE
+    assert tracker.observe(ScreenState.BATTLE, None, 15) == BattlePhase.ACTIVE
+    assert tracker.observe(ScreenState.BATTLE, 1179, 17) == BattlePhase.ACTIVE
+
+
+def test_leaving_the_battle_still_clears_the_active_phase():
+    tracker = BattlePhaseTracker()
+    tracker.observe(ScreenState.BATTLE, 1195, 0)
+    assert tracker.observe(ScreenState.BATTLE, 1182, 13) == BattlePhase.ACTIVE
+    tracker.observe(ScreenState.LOADING, None, 20)
+    assert tracker.observe(ScreenState.BATTLE, None, 21) == BattlePhase.UNKNOWN
+
+
 @pytest.mark.parametrize("clock", [1200, 30, None])
 def test_preparation_hud_never_sends_opening_commands(clock):
     vision = SimpleNamespace(

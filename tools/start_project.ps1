@@ -326,6 +326,95 @@ function Get-GpuRequirementsPath {
     return Join-Path $script:ProjectRoot 'requirements-gpu.txt'
 }
 
+function Get-GpuPins {
+    # Parse the `name==version` pins so the launcher repairs exactly what the
+    # requirements file asks for instead of a hard-coded package list.
+    $pins = @{}
+    try {
+        $text = Get-Content -LiteralPath (Get-GpuRequirementsPath) -Raw -Encoding UTF8
+    } catch {
+        return $pins
+    }
+    foreach ($line in ($text -split "`r?`n")) {
+        $clean = ($line -split '#')[0].Trim()
+        if (-not $clean) { continue }
+        $match = [regex]::Match($clean, '^(?<name>[A-Za-z0-9_.\-]+)(?:\[[^\]]*\])?\s*==\s*(?<version>[^\s;]+)$')
+        if ($match.Success) {
+            $name = ($match.Groups['name'].Value -replace '[_.]+', '-').ToLower()
+            $pins[$name] = $match.Groups['version'].Value
+        }
+    }
+    return $pins
+}
+
+function Get-InstalledDistributionVersions([string]$Python) {
+    # Version probing is advisory: a broken interpreter must never abort the
+    # launch, it only means the CUDA stack cannot be confirmed as current.
+    $probe = 'import json;from importlib import metadata;print(json.dumps({(d.metadata["Name"] or "").lower().replace("_","-").replace(".","-"): d.version for d in metadata.distributions() if d.metadata["Name"]}))'
+    $versions = @{}
+    try {
+        $result = Invoke-PythonCommand $Python @('-I', '-c', $probe) 60
+        if ($result.ExitCode -ne 0) { return $versions }
+        $parsed = ConvertFrom-Json $result.Output
+        foreach ($property in $parsed.PSObject.Properties) {
+            $versions[$property.Name] = [string]$property.Value
+        }
+    } catch {
+        return $versions
+    }
+    return $versions
+}
+
+function Test-GpuStackMatchesRequirements([string]$Python) {
+    # Only replace the stack when it is actually different from the pinned
+    # one. If the pinned build is installed and inference still fails, the
+    # driver is the problem and reinstalling would loop on every launch.
+    $pins = Get-GpuPins
+    if ($pins.Count -eq 0) { return $false }
+    if (@(Get-ConflictingOcrDistributions $Python).Count -gt 0) { return $false }
+    $installed = Get-InstalledDistributionVersions $Python
+    foreach ($name in $pins.Keys) {
+        if (-not $installed.ContainsKey($name)) { return $false }
+        if ($installed[$name] -ne $pins[$name]) { return $false }
+    }
+    return $true
+}
+
+function Get-NvidiaLibraryStem([string]$Name) {
+    # nvidia-cudnn-cu12 and the CUDA 13 style nvidia-cudnn share one directory
+    # in site-packages\nvidia, so only the version-free library stem can be
+    # compared between the two wheel families.
+    return ($Name -replace '-cu\d+$', '')
+}
+
+function Get-ConflictingOcrDistributions([string]$Python) {
+    $pins = Get-GpuPins
+    $pinnedStems = @{}
+    foreach ($name in $pins.Keys) {
+        if ($name.StartsWith('nvidia-')) {
+            $pinnedStems[(Get-NvidiaLibraryStem $name)] = $true
+        }
+    }
+    $installed = Get-InstalledDistributionVersions $Python
+    $conflicts = @()
+    foreach ($name in $installed.Keys) {
+        if ($name -eq 'onnxruntime') {
+            # The CPU wheel writes the same files as the CUDA wheel.
+            $conflicts += $name
+            continue
+        }
+        if (-not $name.StartsWith('nvidia-')) { continue }
+        if (-not $pinnedStems.ContainsKey((Get-NvidiaLibraryStem $name))) {
+            # Unrelated NVIDIA library (for example nvjitlink): leave it alone.
+            continue
+        }
+        if ($pins[$name] -ne $installed[$name]) {
+            $conflicts += $name
+        }
+    }
+    return $conflicts
+}
+
 function Get-NvidiaGpuInfo {
     # A working nvidia-smi is the strongest signal that CUDA can be used. WMI
     # is only a fallback for machines where nvidia-smi is not on PATH.
@@ -447,7 +536,7 @@ function Save-GpuCache([string]$Fingerprint, [string]$Status, [string]$Reason, [
     }
 }
 
-function Invoke-PipInstall([string]$Python, [string[]]$Arguments) {
+function Invoke-PipCommand([string]$Python, [string[]]$Arguments) {
     $env:PYTHONIOENCODING = 'utf-8'
     $env:PYTHONUNBUFFERED = '1'
     $env:PIP_NO_INPUT = '1'
@@ -455,17 +544,46 @@ function Invoke-PipInstall([string]$Python, [string[]]$Arguments) {
     # Keep native stderr as log text in Windows PowerShell 5.1.
     $ErrorActionPreference = 'Continue'
     $quoted = ($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
-    Write-InstallLog "pip install $quoted"
-    & $Python -m pip install --disable-pip-version-check --prefer-binary --progress-bar off --timeout 30 --retries 3 --no-warn-script-location @Arguments 2>&1 | ForEach-Object {
+    Write-InstallLog "pip $quoted"
+    & $Python -m pip @Arguments 2>&1 | ForEach-Object {
         Write-InstallLog $_.ToString()
     }
     $exit = $LASTEXITCODE
     if ($exit -eq 0) {
-        Write-InstallLog 'pip install 完成'
+        Write-InstallLog 'pip 完成'
     } else {
-        Write-InstallLog "pip install 失败（退出码 $exit）"
+        Write-InstallLog "pip 失败（退出码 $exit）"
     }
     return ($exit -eq 0)
+}
+
+function Invoke-PipInstall([string]$Python, [string[]]$Arguments) {
+    return Invoke-PipCommand $Python (@(
+        'install', '--disable-pip-version-check', '--prefer-binary',
+        '--progress-bar', 'off', '--timeout', '30', '--retries', '3',
+        '--no-warn-script-location'
+    ) + $Arguments)
+}
+
+function Remove-ConflictingOcrRuntimes([string]$Python) {
+    # The CPU wheel and the CUDA 13 wheels write exactly the same files as the
+    # CUDA 12 stack (site-packages\onnxruntime and site-packages\nvidia), so
+    # they must be uninstalled instead of installed over: a mixed directory
+    # imports the wrong ONNX Runtime or cannot import at all.
+    $present = @(Get-ConflictingOcrDistributions $Python)
+    if ($present.Count -eq 0) { return $true }
+    Write-StartupLog ("正在替换冲突的 OCR 运行组件：" + ($present -join ', '))
+    return (Invoke-PipCommand $Python (@(
+        'uninstall', '-y', '--disable-pip-version-check'
+    ) + $present))
+}
+
+function Install-GpuStack([string]$Python) {
+    if (-not (Remove-ConflictingOcrRuntimes $Python)) {
+        Write-StartupLog '冲突组件卸载失败，本次继续使用 CPU'
+        return $false
+    }
+    return (Invoke-PipInstall $Python @('-r', (Get-GpuRequirementsPath)))
 }
 
 function Install-ProjectGpuDependencies([string]$Python) {
@@ -514,14 +632,14 @@ function Install-ProjectGpuDependencies([string]$Python) {
     $provider = Test-CudaProvider $Python
     if (-not $provider.Available) {
         Write-StartupLog '正在安装 CUDA/cuDNN OCR 组件（首次可能需要数分钟，详细过程写入 data/install.log）'
-        if (-not (Invoke-PipInstall $Python @('-r', $requirements))) {
+        if (-not (Install-GpuStack $Python)) {
             Save-GpuCache $fingerprint 'failed' 'pip install 失败' 6
             Write-StartupLog 'CUDA 组件安装失败：OCR 将回退 CPU，6 小时后自动重试；可设置 WOWS_FORCE_GPU_INSTALL=1 立即重试'
             return
         }
         $provider = Test-CudaProvider $Python
     } else {
-        Write-StartupLog 'CUDA 运行组件已存在，跳过下载'
+        Write-StartupLog 'CUDA 运行组件已存在，检查实机推理'
     }
     if (-not $provider.Available) {
         Save-GpuCache $fingerprint 'failed' "onnxruntime 未提供 CUDAExecutionProvider（$($provider.Providers)）" 6
@@ -529,9 +647,20 @@ function Install-ProjectGpuDependencies([string]$Python) {
         return
     }
     $verified = Test-CudaInference $Python
+    if ($verified -and -not $verified.Passed -and -not (Test-GpuStackMatchesRequirements $Python)) {
+        # A CUDA 13 build cannot initialise on a driver below R580, and the
+        # provider list still advertises CUDA in that state. Replace the stack
+        # with the pinned CUDA 12 build once, then re-verify, instead of
+        # recording a permanent "installed but unverified" cache entry.
+        Write-StartupLog '实机推理失败：当前 OCR 运行组件与锁定的 CUDA 12 组件不一致，正在替换后重试'
+        if (Install-GpuStack $Python) {
+            $provider = Test-CudaProvider $Python
+            $verified = Test-CudaInference $Python
+        }
+    }
     if ($verified -and -not $verified.Passed) {
         Save-GpuCache $fingerprint 'ready_unverified' "provider 可用，实机推理失败：$($verified.Detail)"
-        Write-StartupLog 'CUDA 组件已安装，但实机推理验证未通过；任务启动时会再次检查并自动回退 CPU'
+        Write-StartupLog "CUDA 组件已安装，但实机推理验证未通过（$($provider.Providers)）；OCR 将回退 CPU。请更新 NVIDIA 驱动：CUDA 12 需要 525 以上，CUDA 13 需要 580 以上"
         return
     }
     if ($verified) {

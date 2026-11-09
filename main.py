@@ -667,6 +667,38 @@ def battle_overlay_text_confirmed(image, backend, state) -> bool:
     return False
 
 
+def port_battle_action_visible(bot, image) -> bool:
+    """OCR-confirm the port's own ``加入战斗`` action on a visual conflict.
+
+    A harbour close-up satisfies the broad battle-HUD anchors (the ship
+    carousel reads as a minimap) and the port-anchor calibration is tuned for a
+    bright harbour, so a dark or night port used to classify as BATTLE. The
+    rendered action label is exposure independent and never appears in a live
+    match, so it resolves the conflict without weakening the battle anchors.
+
+    The verdict is cached per captured frame: the same frame is classified by
+    several lifecycle gates and the OCR must not run once per gate.
+    """
+    backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
+    if backend is None or image is None or not getattr(image, "size", 0):
+        return False
+    cached = getattr(bot, "_port_action_ocr", None)
+    if cached is not None and cached[0] is image:
+        return cached[1]
+    try:
+        visible = port_battle_action_point(image, backend) is not None
+    except Exception:
+        logger.debug("港口加入战斗 OCR 复核失败；保留原判定", exc_info=True)
+        visible = False
+    bot._port_action_ocr = (image, visible)
+    return visible
+
+
+def battle_control_established(bot) -> bool:
+    """True once this round's combat control has been confirmed and set up."""
+    return bool(getattr(bot, "_round_control_initialized", False))
+
+
 def classify_runtime_screen(bot, image) -> ScreenState:
     """Classify normal game pages plus OCR-confirmed first-login rewards."""
     state = bot.vision.classify_screen(image)
@@ -678,6 +710,17 @@ def classify_runtime_screen(bot, image) -> ScreenState:
         # must be closed before driving, ship selection or battle entry.
         if port_subpage_title(image, backend) is not None:
             return ScreenState.UNKNOWN
+    if (
+        state in {ScreenState.BATTLE, ScreenState.LOADING}
+        and not battle_control_established(bot)
+        and port_battle_action_visible(bot, image)
+    ):
+        # Before this round's control exists a port must never enter the combat
+        # loop. Without this the bot waited forever on "正式开战未确认" for a
+        # match clock that the port does not have, and never selected a ship or
+        # joined a battle at all.
+        logger.info("OCR 确认港口“加入战斗”按钮，覆盖本帧%s误判", state.value)
+        return ScreenState.PORT
     # Some loading-tip artwork resembles result buttons. The exact current
     # start-action text is stronger proof that no battle has finished yet.
     if state == ScreenState.RESULTS and loading_start_confirmed(bot, image):
@@ -820,6 +863,12 @@ def classify_battle_continuity_screen(bot, image) -> ScreenState:
             logger.debug("战斗连续性数值 HUD 复核失败，保留当前判定", exc_info=True)
     if state != ScreenState.PORT:
         return state
+    if port_battle_action_visible(bot, image):
+        # The rendered port action outranks the broad HUD texture anchors: a
+        # dense harbour carousel satisfies them, and turning that frame into
+        # BATTLE made the setup wait forever for a match clock that only a live
+        # match has.
+        return ScreenState.PORT
     detector = getattr(bot.vision, "_has_battle_hud", None)
     if not callable(detector):
         return state
@@ -1516,6 +1565,40 @@ def wait_for_battle(
                             "开局小地图玩家箭头预检失败，等待后续帧",
                             exc_info=True,
                         )
+                # Start the engine as soon as two battle HUD frames confirm the
+                # round. Throttle does not depend on the minimap pose, and
+                # gating it behind the pose grace period left the ship at STOP
+                # for the first 15-20 s of the match. The M-map waypoint still
+                # waits for a reliable pose below; only W is moved forward.
+                if not getattr(bot, "_opening_motion_prestarted", False):
+                    pending_setup = bool(
+                        getattr(bot, "_opening_autopilot_retry_pending", False)
+                    )
+                    if pending_setup:
+                        logger.info(
+                            "自动航行配置待恢复：先复核已有航线，避免全速指令取消航线"
+                        )
+                    else:
+                        reassert_throttle = getattr(
+                            bot.gamepad, "reassert_full_speed", None
+                        )
+                        full_speed_throttle = getattr(
+                            bot.gamepad, "full_speed", None
+                        )
+                        if reassert_throttle is None and full_speed_throttle is None:
+                            logger.debug("输入后端未提供全速指令；交给战斗控制处理")
+                        else:
+                            try:
+                                if reassert_throttle is not None:
+                                    reassert_throttle()
+                                else:
+                                    full_speed_throttle()
+                                setattr(bot, "_opening_motion_prestarted", True)
+                                logger.info("战斗 HUD 已出现，已立即下发全速前进")
+                            except RuntimeError as error:
+                                logger.info(
+                                    "开局全速指令被暂停/前台互锁撤销: %s", error
+                                )
                 if not opening_pose_ready:
                     # Pose availability is not the battle identity. Give the
                     # marker a short grace period, then hand a stable HUD to
@@ -1529,23 +1612,17 @@ def wait_for_battle(
                         "结束入局等待，由战斗控制继续定位，不消耗 M 图尝试"
                     )
                     return True
-                # Start movement on the first reliable post-loading HUD frame.
-                # Clock OCR can take several seconds on its first GPU call, so
-                # start the engine immediately, then establish native
-                # autopilot while lifecycle identity is confirmed in the
-                # background.  A failed map click must never leave a ship at
-                # STOP while the clock/OCR checks continue.
                 opening_attempted = True
                 reassert = getattr(bot.gamepad, "reassert_full_speed", None)
                 try:
                     pending_setup = bool(getattr(bot, "_opening_autopilot_retry_pending", False))
                     if pending_setup:
                         logger.info("自动航行配置待恢复：先复核已有航线，避免全速指令取消航线")
-                    elif reassert is not None:
-                        reassert()
-                    else:
-                        bot.gamepad.full_speed()
-                    if not pending_setup:
+                    elif not getattr(bot, "_opening_motion_prestarted", False):
+                        if reassert is not None:
+                            reassert()
+                        else:
+                            bot.gamepad.full_speed()
                         setattr(bot, "_opening_motion_prestarted", True)
                         logger.info("新一局 HUD 已出现，已立即下发全速前进")
                 except RuntimeError as error:
@@ -1723,6 +1800,13 @@ def run_battle(
                     )
                 ))
                 if now_monotonic - since >= wait_seconds:
+                    if port_battle_action_visible(bot, control_frame):
+                        logger.warning(
+                            "战斗阶段无法确认，但已 OCR 确认港口“加入战斗”按钮；"
+                            "按港口重新分流且不发送 Esc"
+                        )
+                        bot._battle_phase_unconfirmed_since = None
+                        return "resume_state"
                     attempts = int(getattr(bot, "_battle_phase_escape_attempts", 0))
                     hint = None
                     if attempts < 3 and not operation_paused(bot):

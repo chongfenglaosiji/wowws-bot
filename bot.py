@@ -281,6 +281,17 @@ class BattleBot:
             if self._distance_ocr_async
             else None
         )
+        # Share the warm OCR backend with the scene classifier. Port detection
+        # then has a text-based fallback for harbours whose dark artwork fails
+        # the brightness-based anchors, instead of only colour and texture.
+        # Stub/adaptor vision objects may be arbitrary instances, so a failure
+        # here must only downgrade to the pure visual decision.
+        try:
+            self.vision.text_backend = getattr(
+                self.distance_reader, "backend", None
+            )
+        except Exception:
+            logger.debug("视觉对象不支持 OCR 后端注入；保持纯视觉判定", exc_info=True)
 
         self.movement = SecondaryMovementController(
             pursue_enemies=bool(self.strategy.get("pursue_enemies", False)),
